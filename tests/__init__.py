@@ -1,1 +1,1 @@
-# Tests for fast-gate
+# Tests for byte-gate

@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 import xxhash
 
-from fast_gate.db import DedupeDatabase, uint64_to_signed
+from byte_gate.db import DedupeDatabase, uint64_to_signed
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

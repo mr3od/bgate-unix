@@ -1,4 +1,4 @@
-"""Database schema and connection management for fast-gate."""
+"""Database schema and connection management for byte-gate."""
 
 from __future__ import annotations
 
