@@ -1,5 +1,5 @@
 [project]
-name = "byte-gate"
+name = "triagehash"
 version = "0.1.0"
 description = "High-performance tiered file deduplication using xxHash64 and SQLite. Minimizes disk I/O in high-volume pipelines through short-circuit binary identity verification."
 readme = "README.md"
