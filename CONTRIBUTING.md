@@ -1,6 +1,6 @@
-# Contributing to fast-gate
+# Contributing to byte-gate
 
-Thanks for your interest in contributing to fast-gate! This guide will help you get started.
+Thanks for your interest in contributing to byte-gate! This guide will help you get started.
 
 ## Development Setup
 
@@ -13,8 +13,8 @@ Thanks for your interest in contributing to fast-gate! This guide will help you 
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/mr3od/fast-gate.git
-cd fast-gate
+git clone https://github.com/mr3od/byte-gate.git
+cd byte-gate
 ```
 
 2. Install dependencies with uv:
@@ -98,8 +98,8 @@ uv run pytest
 ## Project Structure
 
 ```
-fast-gate/
-├── src/fast_gate/       # Main package
+byte-gate/
+├── src/byte_gate/       # Main package
 │   ├── __init__.py      # Package exports
 │   ├── engine.py        # Core deduplication logic
 │   ├── db.py            # Database layer

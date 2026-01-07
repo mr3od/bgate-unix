@@ -1,18 +1,18 @@
-# fast-gate
+# byte-gate
 
 High-performance Layer 0 binary deduplication with tiered short-circuit logic.
 
-[![CI](https://github.com/mr3od/fast-gate/actions/workflows/ci.yml/badge.svg)](https://github.com/mr3od/fast-gate/actions/workflows/ci.yml)
+[![CI](https://github.com/mr3od/byte-gate/actions/workflows/ci.yml/badge.svg)](https://github.com/mr3od/byte-gate/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ## Overview
 
-fast-gate is a "gatekeeper" that performs strict binary identity deduplication (exact byte-match) using tiered short-circuit logic to minimize disk I/O costs. Designed for local network file processing pipelines where disk I/O is the bottleneck.
+byte-gate is a "gatekeeper" that performs strict binary identity deduplication (exact byte-match) using tiered short-circuit logic to minimize disk I/O costs. Designed for local network file processing pipelines where disk I/O is the bottleneck.
 
 ### Why Layer 0?
 
-Processing costs are expensive. Whether you're running OCR, AI indexing, or complex transcoding, the most expensive file is the one you've already processed. fast-gate ensures that:
+Processing costs are expensive. Whether you're running OCR, AI indexing, or complex transcoding, the most expensive file is the one you've already processed. byte-gate ensures that:
 
 - **Most unique files** are verified via metadata (Tier 1) in microseconds
 - **Files with size collisions** are verified via 16KB "Fringe" checks (Tier 2)
@@ -76,10 +76,10 @@ This reduces downstream processing costs and storage overhead significantly with
 
 ```bash
 # Using uv (recommended)
-uv add fast-gate
+uv add byte-gate
 
 # Using pip
-pip install fast-gate
+pip install byte-gate
 ```
 
 ## Quick Start
@@ -103,8 +103,8 @@ with FileDeduplicator("dedupe.db") as deduper:
 ### Basic Deduplication
 
 ```python
-from fast_gate import FileDeduplicator
-from fast_gate.engine import DedupeResult
+from byte_gate import FileDeduplicator
+from byte_gate.engine import DedupeResult
 
 with FileDeduplicator("index.db") as deduper:
     result = deduper.process_file("/path/to/file.bin")
@@ -122,7 +122,7 @@ with FileDeduplicator("index.db") as deduper:
 
 ```python
 from pathlib import Path
-from fast_gate import FileDeduplicator
+from byte_gate import FileDeduplicator
 
 # Unique files are atomically moved to processing/
 with FileDeduplicator(
@@ -146,8 +146,8 @@ deduper = FileDeduplicator("index.db", optimize_for_hdd=True)
 ### Batch Processing
 
 ```python
-from fast_gate import FileDeduplicator
-from fast_gate.engine import DedupeResult
+from byte_gate import FileDeduplicator
+from byte_gate.engine import DedupeResult
 
 with FileDeduplicator("index.db") as deduper:
     results = list(deduper.process_directory("incoming/", recursive=True))
@@ -210,8 +210,8 @@ File moves use `os.replace()` for POSIX atomicity, ensuring no partial writes or
 
 ```bash
 # Clone and setup
-git clone https://github.com/mr3od/fast-gate.git
-cd fast-gate
+git clone https://github.com/mr3od/byte-gate.git
+cd byte-gate
 uv sync --dev
 
 # Run tests
@@ -224,7 +224,3 @@ uv run ruff format .
 # Type check
 uv run ty check src/
 ```
-
-## License
-
-MIT License - see [LICENSE](LICENSE) for details.

@@ -1,4 +1,4 @@
-"""Comprehensive test suite for fast-gate deduplication engine."""
+"""Comprehensive test suite for byte-gate deduplication engine."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from fast_gate.db import DedupeDatabase, signed_to_uint64, uint64_to_signed
-from fast_gate.engine import (
+from byte_gate.db import DedupeDatabase, signed_to_uint64, uint64_to_signed
+from byte_gate.engine import (
     CHUNK_SIZE,
     FRINGE_SIZE,
     DedupeResult,
