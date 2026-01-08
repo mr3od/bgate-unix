@@ -194,7 +194,7 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
-# byte-gate specific
+# bgate-unix specific
 *.db
 *.db-wal
 *.db-shm

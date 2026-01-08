@@ -1,1 +1,1 @@
-# Tests for byte-gate
+# Tests for bgate-unix

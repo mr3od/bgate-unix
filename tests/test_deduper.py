@@ -1,4 +1,4 @@
-"""Comprehensive test suite for byte-gate deduplication engine."""
+"""Comprehensive test suite for bgate-unix deduplication engine."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from byte_gate.db import DedupeDatabase, signed_to_uint64, uint64_to_signed
-from byte_gate.engine import (
+from bgate_unix.db import DedupeDatabase
+from bgate_unix.engine import (
     CHUNK_SIZE,
     FRINGE_SIZE,
     DedupeResult,
@@ -54,44 +54,6 @@ def processing_dir(temp_dir: Path) -> Path:
     return processing
 
 
-class TestIntegerConversion:
-    """Test signed/unsigned 64-bit integer conversion."""
-
-    def test_small_positive(self):
-        """Small positive values should remain unchanged."""
-        assert uint64_to_signed(100) == 100
-        assert signed_to_uint64(100) == 100
-
-    def test_max_signed(self):
-        """Maximum signed value should remain unchanged."""
-        max_signed = (1 << 63) - 1
-        assert uint64_to_signed(max_signed) == max_signed
-        assert signed_to_uint64(max_signed) == max_signed
-
-    def test_overflow_to_negative(self):
-        """Values above max signed should become negative."""
-        # 2^63 should become -2^63
-        value = 1 << 63
-        signed = uint64_to_signed(value)
-        assert signed < 0
-        assert signed_to_uint64(signed) == value
-
-    def test_max_unsigned(self):
-        """Maximum unsigned value should convert correctly."""
-        max_unsigned = (1 << 64) - 1
-        signed = uint64_to_signed(max_unsigned)
-        assert signed == -1
-        assert signed_to_uint64(signed) == max_unsigned
-
-    def test_roundtrip(self):
-        """Conversion should be reversible."""
-        test_values = [0, 1, 1000, (1 << 63) - 1, 1 << 63, (1 << 64) - 1]
-        for value in test_values:
-            signed = uint64_to_signed(value)
-            unsigned = signed_to_uint64(signed)
-            assert unsigned == value
-
-
 class TestAtomicMove:
     """Test atomic file move operation."""
 
@@ -118,25 +80,28 @@ class TestAtomicMove:
         assert dest.exists()
         assert dest.read_text() == "test"
 
-    def test_overwrites_existing(self, temp_dir: Path):
-        """Should overwrite existing destination file."""
+    def test_refuses_overwrite(self, temp_dir: Path):
+        """Should refuse to overwrite existing destination file."""
         src = temp_dir / "source.txt"
         dest = temp_dir / "dest.txt"
         src.write_text("new content")
         dest.write_text("old content")
 
-        atomic_move(src, dest)
+        with pytest.raises(FileExistsError):
+            atomic_move(src, dest)
 
-        assert dest.read_text() == "new content"
+        # Source should still exist, dest unchanged
+        assert src.read_text() == "new content"
+        assert dest.read_text() == "old content"
 
 
 class TestDedupeDatabase:
-    """Test database operations."""
+    """Test database operations with BLOB-based hashes."""
 
     def test_connection(self, db_path: Path):
         """Database should connect and create schema."""
         with DedupeDatabase(db_path) as db:
-            assert db.connection is not None
+            assert db.db is not None
 
     def test_size_operations(self, db_path: Path):
         """Size index operations should work correctly."""
@@ -145,26 +110,40 @@ class TestDedupeDatabase:
             db.add_size(1000)
             assert db.size_exists(1000)
 
-    def test_fringe_operations(self, db_path: Path):
-        """Fringe index operations should work correctly."""
+    def test_fringe_operations_blob(self, db_path: Path):
+        """Fringe index operations should work with BLOB hashes."""
         with DedupeDatabase(db_path) as db:
-            assert db.fringe_lookup(12345, 1000) is None
-            db.add_fringe(12345, 1000, "/path/to/file")
-            assert db.fringe_lookup(12345, 1000) == "/path/to/file"
+            fringe_hash = b"\x01\x02\x03\x04\x05\x06\x07\x08"
+            assert db.fringe_lookup(fringe_hash, 1000) is None
+            db.add_fringe(fringe_hash, 1000, "/path/to/file")
+            assert db.fringe_lookup(fringe_hash, 1000) == "/path/to/file"
 
-    def test_full_operations(self, db_path: Path):
-        """Full hash index operations should work correctly."""
+    def test_full_operations_blob(self, db_path: Path):
+        """Full hash index operations should work with BLOB hashes."""
         with DedupeDatabase(db_path) as db:
-            assert db.full_lookup(99999) is None
-            db.add_full(99999, "/path/to/file")
-            assert db.full_lookup(99999) == "/path/to/file"
+            full_hash = b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10"
+            assert db.full_lookup(full_hash) is None
+            db.add_full(full_hash, "/path/to/file")
+            assert db.full_lookup(full_hash) == "/path/to/file"
 
-    def test_negative_hash_storage(self, db_path: Path):
-        """Should handle negative (signed) hash values."""
+    def test_schema_version(self, db_path: Path):
+        """Schema version should be set correctly."""
         with DedupeDatabase(db_path) as db:
-            negative_hash = -9223372036854775808  # Min signed 64-bit
-            db.add_full(negative_hash, "/test/path")
-            assert db.full_lookup(negative_hash) == "/test/path"
+            assert db.schema_version == 2
+
+    def test_move_journal(self, db_path: Path):
+        """Move journal operations should work correctly."""
+        with DedupeDatabase(db_path) as db:
+            journal_id = db.journal_move("/src/file.txt", "/dest/file.txt", 1000)
+            assert journal_id > 0
+
+            entries = db.get_incomplete_journal_entries()
+            assert len(entries) == 1
+            assert entries[0]["phase"] == "planned"
+
+            db.update_move_phase(journal_id, "completed")
+            entries = db.get_incomplete_journal_entries()
+            assert len(entries) == 0
 
 
 class TestTier0EmptyFiles:
@@ -224,25 +203,28 @@ class TestTier2FringeHash:
         """Files with same size but different content should be unique."""
         file1 = temp_dir / "file1.txt"
         file2 = temp_dir / "file2.txt"
-        file1.write_bytes(b"a" * 100)
-        file2.write_bytes(b"b" * 100)
+        file1.write_bytes(os.urandom(100))
+        file2.write_bytes(os.urandom(100))
 
         result1 = deduplicator.process_file(file1)
         result2 = deduplicator.process_file(file2)
 
         assert result1.result == DedupeResult.UNIQUE
         assert result2.result == DedupeResult.UNIQUE
-        # Second file should be determined at Tier 2 or 3
         assert result2.tier >= 2
 
     def test_large_file_fringe_hash(self, deduplicator: FileDeduplicator, temp_dir: Path):
         """Large files should use fringe hash correctly."""
-        # Create file larger than 2 * FRINGE_SIZE
         file1 = temp_dir / "large1.bin"
         file2 = temp_dir / "large2.bin"
 
-        content1 = b"A" * FRINGE_SIZE + b"M" * FRINGE_SIZE + b"Z" * FRINGE_SIZE
-        content2 = b"A" * FRINGE_SIZE + b"X" * FRINGE_SIZE + b"Z" * FRINGE_SIZE
+        head = os.urandom(FRINGE_SIZE)
+        tail = os.urandom(FRINGE_SIZE)
+        middle1 = b"M" * FRINGE_SIZE
+        middle2 = b"X" * FRINGE_SIZE
+
+        content1 = head + middle1 + tail
+        content2 = head + middle2 + tail
 
         file1.write_bytes(content1)
         file2.write_bytes(content2)
@@ -256,13 +238,13 @@ class TestTier2FringeHash:
 
 
 class TestTier3FullHash:
-    """Test Tier 3: Full content hash deduplication."""
+    """Test Tier 3: Full content hash deduplication (xxHash128)."""
 
     def test_exact_duplicate_detected(self, deduplicator: FileDeduplicator, temp_dir: Path):
         """Exact binary duplicates should be detected."""
         file1 = temp_dir / "original.txt"
         file2 = temp_dir / "duplicate.txt"
-        content = b"This is the exact same content"
+        content = os.urandom(100)
         file1.write_bytes(content)
         file2.write_bytes(content)
 
@@ -278,7 +260,6 @@ class TestTier3FullHash:
         file1 = temp_dir / "large1.bin"
         file2 = temp_dir / "large2.bin"
 
-        # Create file larger than chunk size
         content = os.urandom(CHUNK_SIZE * 3)
         file1.write_bytes(content)
         file2.write_bytes(content)
@@ -290,30 +271,6 @@ class TestTier3FullHash:
         assert result2.result == DedupeResult.DUPLICATE
 
 
-class TestHDDOptimization:
-    """Test HDD optimization mode."""
-
-    def test_hdd_mode_sequential_read(self, db_path: Path, temp_dir: Path):
-        """HDD mode should use sequential reads."""
-        with FileDeduplicator(db_path, optimize_for_hdd=True) as deduper:
-            file1 = temp_dir / "file1.bin"
-            file2 = temp_dir / "file2.bin"
-
-            # Files with same first 16KB but different endings
-            content1 = b"A" * 20000 + b"B" * 10000
-            content2 = b"A" * 20000 + b"C" * 10000
-
-            file1.write_bytes(content1)
-            file2.write_bytes(content2)
-
-            result1 = deduper.process_file(file1)
-            result2 = deduper.process_file(file2)
-
-            # Both should be unique (full hash will differ)
-            assert result1.result == DedupeResult.UNIQUE
-            assert result2.result == DedupeResult.UNIQUE
-
-
 class TestProcessingDirectory:
     """Test file movement to processing directory."""
 
@@ -321,45 +278,46 @@ class TestProcessingDirectory:
         """Unique files should be moved to processing directory."""
         with FileDeduplicator(db_path, processing_dir=processing_dir) as deduper:
             src_file = inbound_dir / "unique.txt"
-            src_file.write_text("unique content")
+            src_file.write_bytes(os.urandom(100))
 
             result = deduper.process_file(src_file)
 
             assert result.result == DedupeResult.UNIQUE
             assert not src_file.exists()
-            assert (processing_dir / "unique.txt").exists()
+            files_in_processing = list(processing_dir.iterdir())
+            assert len(files_in_processing) == 1
+            assert files_in_processing[0].suffix == ".txt"
 
     def test_duplicate_not_moved(self, db_path: Path, inbound_dir: Path, processing_dir: Path):
         """Duplicate files should not be moved."""
         with FileDeduplicator(db_path, processing_dir=processing_dir) as deduper:
-            # First file - unique
+            content = os.urandom(100)
+
             file1 = inbound_dir / "original.txt"
-            file1.write_text("same content")
+            file1.write_bytes(content)
             deduper.process_file(file1)
 
-            # Second file - duplicate
             file2 = inbound_dir / "duplicate.txt"
-            file2.write_text("same content")
+            file2.write_bytes(content)
             result = deduper.process_file(file2)
 
             assert result.result == DedupeResult.DUPLICATE
-            assert file2.exists()  # Duplicate stays in place
+            assert file2.exists()
 
     def test_name_collision_handling(self, db_path: Path, inbound_dir: Path, processing_dir: Path):
-        """Should handle name collisions in processing directory."""
+        """Should handle multiple unique files with hash-based naming."""
         with FileDeduplicator(db_path, processing_dir=processing_dir) as deduper:
-            # Create file with same name but different content
             file1 = inbound_dir / "file.txt"
-            file1.write_text("content 1")
+            file1.write_bytes(os.urandom(100))
             deduper.process_file(file1)
 
             file2 = inbound_dir / "file.txt"
-            file2.write_text("content 2")
+            file2.write_bytes(os.urandom(100))
             deduper.process_file(file2)
 
-            # Both should exist with different names
-            assert (processing_dir / "file.txt").exists()
-            assert (processing_dir / "file_1.txt").exists()
+            files_in_processing = list(processing_dir.iterdir())
+            assert len(files_in_processing) == 2
+            assert all(f.suffix == ".txt" for f in files_in_processing)
 
 
 class TestDirectoryProcessing:
@@ -370,9 +328,10 @@ class TestDirectoryProcessing:
         test_dir = temp_dir / "batch"
         test_dir.mkdir()
 
-        (test_dir / "file1.txt").write_text("content 1")
-        (test_dir / "file2.txt").write_text("content 2")
-        (test_dir / "file3.txt").write_text("content 1")  # Duplicate of file1
+        content = os.urandom(100)
+        (test_dir / "file1.txt").write_bytes(content)
+        (test_dir / "file2.txt").write_bytes(os.urandom(100))
+        (test_dir / "file3.txt").write_bytes(content)  # Duplicate of file1
 
         results = list(deduplicator.process_directory(test_dir))
 
@@ -388,8 +347,8 @@ class TestDirectoryProcessing:
         test_dir.mkdir()
         (test_dir / "sub").mkdir()
 
-        (test_dir / "file1.txt").write_text("content 1")
-        (test_dir / "sub" / "file2.txt").write_text("content 2")
+        (test_dir / "file1.txt").write_bytes(os.urandom(100))
+        (test_dir / "sub" / "file2.txt").write_bytes(os.urandom(100))
 
         results = list(deduplicator.process_directory(test_dir, recursive=True))
         assert len(results) == 2
@@ -402,8 +361,8 @@ class TestStats:
         """Stats should reflect processed files."""
         file1 = temp_dir / "file1.txt"
         file2 = temp_dir / "file2.txt"
-        file1.write_text("content 1")
-        file2.write_text("different content 2")  # Different size
+        file1.write_bytes(os.urandom(100))
+        file2.write_bytes(os.urandom(200))
 
         deduplicator.process_file(file1)
         deduplicator.process_file(file2)
@@ -411,6 +370,8 @@ class TestStats:
         stats = deduplicator.stats
         assert stats["unique_sizes"] == 2
         assert stats["full_entries"] == 2
+        assert stats["schema_version"] == 2
+        assert "pending_journal" in stats
 
 
 class TestErrorHandling:
@@ -429,3 +390,16 @@ class TestErrorHandling:
 
         with pytest.raises(ValueError, match="Not a directory"):
             list(deduplicator.process_directory(file_path))
+
+
+class TestJournalRecovery:
+    """Test journal-based recovery."""
+
+    def test_journal_recovery_on_connect(self, db_path: Path):
+        """Should recover from incomplete journal entries on connect."""
+        with DedupeDatabase(db_path) as db:
+            db.journal_move("/src/file.txt", "/dest/file.txt", 1000)
+
+        with FileDeduplicator(db_path) as deduper:
+            stats = deduper.stats
+            assert stats["pending_journal"] == 0
