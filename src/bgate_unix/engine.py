@@ -190,22 +190,22 @@ class FileDeduplicator:
             raise RuntimeError("Deduplicator not connected. Use connect() or context manager.")
 
     def _validate_path(self, path: Path) -> tuple[bool, str | None]:
-        """Validate path for security and accessibility."""
+        """Validate path for security and accessibility.
+
+        Note: Symlinks are not followed by process_directory (uses follow_symlinks=False).
+        This validation is for direct process_file() calls only.
+        """
         try:
             path_str = str(path)
             if not path_str or "\x00" in path_str:
                 return False, "Invalid file path"
 
+            # Reject symlinks - they're skipped by directory scanner anyway
+            if path.is_symlink():
+                return False, "Symlinks not supported"
+
             if not path.is_file():
                 return False, "Not a regular file"
-
-            if path.is_symlink():
-                real_path = path.resolve()
-                if self._processing_dir:
-                    try:
-                        real_path.relative_to(self._processing_dir.parent)
-                    except ValueError:
-                        return False, "Symlink escapes allowed directory"
 
             if not os.access(path, os.R_OK):
                 return False, "File not readable"
@@ -409,13 +409,22 @@ class FileDeduplicator:
     def _write_emergency_orphan(
         self, original_path: Path, orphan_path: Path, file_size: int
     ) -> None:
-        """Write orphan info to emergency file when DB is unavailable."""
-        emergency_file = self._db.db_path.parent / "emergency_orphans.txt"
+        """Write orphan info to emergency file when DB is unavailable.
+
+        Uses JSON for safe serialization (filenames can contain any character).
+        """
+        import json
+
+        emergency_file = self._db.db_path.parent / "emergency_orphans.jsonl"
         try:
             with emergency_file.open("a") as f:
-                f.write(
-                    f"{datetime.now(UTC).isoformat()}|{original_path}|{orphan_path}|{file_size}\n"
-                )
+                record = {
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "original_path": str(original_path),
+                    "orphan_path": str(orphan_path),
+                    "file_size": file_size,
+                }
+                f.write(json.dumps(record) + "\n")
             logger.error("DB unavailable - wrote orphan to emergency file: {}", emergency_file)
         except OSError:
             logger.critical(
@@ -427,25 +436,30 @@ class FileDeduplicator:
 
     def _check_emergency_orphans(self) -> None:
         """Check for emergency orphans file and import if present."""
-        emergency_file = self._db.db_path.parent / "emergency_orphans.txt"
-        if emergency_file.exists():
-            try:
-                line_count = sum(1 for _ in emergency_file.open())
-                logger.warning(
-                    "Emergency orphans file found at {} with {} entries",
-                    emergency_file,
-                    line_count,
-                )
-                imported = self._import_emergency_orphans(emergency_file)
-                if imported > 0:
-                    logger.info("Imported {} emergency orphan records", imported)
-            except OSError as e:
-                logger.error("Failed to read emergency orphans file: {}", e)
+        # Check both old format (.txt) and new format (.jsonl)
+        for filename in ["emergency_orphans.jsonl", "emergency_orphans.txt"]:
+            emergency_file = self._db.db_path.parent / filename
+            if emergency_file.exists():
+                try:
+                    line_count = sum(1 for _ in emergency_file.open())
+                    logger.warning(
+                        "Emergency orphans file found at {} with {} entries",
+                        emergency_file,
+                        line_count,
+                    )
+                    imported = self._import_emergency_orphans(emergency_file)
+                    if imported > 0:
+                        logger.info("Imported {} emergency orphan records", imported)
+                except OSError as e:
+                    logger.error("Failed to read emergency orphans file: {}", e)
 
     def _import_emergency_orphans(self, emergency_file: Path) -> int:
         """Import emergency orphan records into the database."""
+        import json
+
         imported = 0
         remaining_lines: list[str] = []
+        is_jsonl = emergency_file.suffix == ".jsonl"
 
         try:
             with emergency_file.open() as f:
@@ -454,20 +468,27 @@ class FileDeduplicator:
                     if not line:
                         continue
                     try:
-                        parts = line.split("|")
-                        if len(parts) >= 4:
+                        if is_jsonl:
+                            record = json.loads(line)
+                            original_path = record["original_path"]
+                            orphan_path = record["orphan_path"]
+                            file_size = record["file_size"]
+                        else:
+                            # Legacy pipe-delimited format
+                            parts = line.split("|")
+                            if len(parts) < 4:
+                                remaining_lines.append(line)
+                                continue
                             original_path = parts[1]
                             orphan_path = parts[2]
                             file_size = int(parts[3])
 
-                            if Path(orphan_path).exists():
-                                self._db.add_orphan(original_path, orphan_path, file_size)
-                                imported += 1
-                            else:
-                                logger.warning("Emergency orphan no longer exists: {}", orphan_path)
+                        if Path(orphan_path).exists():
+                            self._db.add_orphan(original_path, orphan_path, file_size)
+                            imported += 1
                         else:
-                            remaining_lines.append(line)
-                    except (ValueError, IndexError) as e:
+                            logger.warning("Emergency orphan no longer exists: {}", orphan_path)
+                    except (ValueError, KeyError, json.JSONDecodeError) as e:
                         logger.warning("Failed to parse emergency orphan line: {} ({})", line, e)
                         remaining_lines.append(line)
 
@@ -485,7 +506,11 @@ class FileDeduplicator:
         return imported
 
     def _recover_from_journal(self) -> int:
-        """Recover from incomplete journal entries."""
+        """Recover from incomplete journal entries.
+
+        Critical: Files in 'moving' state have been physically moved but NOT indexed.
+        We must move them back to source so they can be re-processed and properly indexed.
+        """
         incomplete = self._db.get_incomplete_journal_entries()
         recovered = 0
 
@@ -496,16 +521,32 @@ class FileDeduplicator:
             journal_id = entry["id"]
 
             if phase == "planned":
+                # Move never started - just mark as failed
                 self._db.update_move_phase(journal_id, "failed")
                 recovered += 1
             elif phase == "moving":
+                # File was moved but index registration never completed.
+                # Must rollback to source for re-processing.
                 if dest.exists() and not source.exists():
-                    self._db.update_move_phase(journal_id, "completed")
-                    recovered += 1
+                    try:
+                        atomic_move(dest, source)
+                        self._db.update_move_phase(journal_id, "failed")
+                        logger.info("Rolled back incomplete move: {} -> {}", dest, source)
+                        recovered += 1
+                    except OSError as e:
+                        logger.error(
+                            "Critical: Cannot rollback move {} -> {}: {}. "
+                            "File exists in processing_dir but is NOT indexed!",
+                            dest,
+                            source,
+                            e,
+                        )
                 elif source.exists() and not dest.exists():
+                    # Move never happened - mark failed
                     self._db.update_move_phase(journal_id, "failed")
                     recovered += 1
                 elif source.exists() and dest.exists():
+                    # Partial state - remove dest, keep source
                     try:
                         dest.unlink()
                         self._db.update_move_phase(journal_id, "failed")
@@ -513,6 +554,7 @@ class FileDeduplicator:
                     except OSError:
                         logger.error("Cannot clean up partial move: {} -> {}", source, dest)
                 else:
+                    # Both missing - manual intervention occurred
                     self._db.update_move_phase(journal_id, "failed")
                     recovered += 1
 
