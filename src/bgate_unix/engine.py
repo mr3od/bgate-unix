@@ -192,8 +192,11 @@ class FileDeduplicator:
     def _validate_path(self, path: Path) -> tuple[bool, str | None]:
         """Validate path for security and accessibility.
 
-        Note: Symlinks are not followed by process_directory (uses follow_symlinks=False).
-        This validation is for direct process_file() calls only.
+        Symlinks are explicitly not supported:
+        - process_directory() filters them out via is_file(follow_symlinks=False)
+        - Direct process_file() calls are rejected here
+
+        This prevents symlink-based attacks and ensures consistent behavior.
         """
         try:
             path_str = str(path)
