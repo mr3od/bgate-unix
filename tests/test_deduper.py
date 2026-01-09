@@ -94,6 +94,26 @@ class TestAtomicMove:
         assert src.read_text() == "new content"
         assert dest.read_text() == "old content"
 
+    def test_cross_device_move_raises_exdev(self, temp_dir: Path, monkeypatch):
+        """Cross-device moves should raise clear OSError with EXDEV context."""
+        import errno
+
+        src = temp_dir / "source.txt"
+        dest = temp_dir / "dest.txt"
+        src.write_text("test content")
+
+        def mock_link(src_path, dest_path):
+            raise OSError(errno.EXDEV, "Cross-device link")
+
+        monkeypatch.setattr("os.link", mock_link)
+
+        with pytest.raises(OSError, match="Cross-device move failed"):
+            atomic_move(src, dest)
+
+        # Source should still exist after failed cross-device attempt
+        assert src.exists()
+        assert src.read_text() == "test content"
+
 
 class TestDedupeDatabase:
     """Test database operations with BLOB-based hashes."""

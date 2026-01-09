@@ -6,11 +6,14 @@ Absolute trust model: xxh128 collisions are treated as impossible.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
+import signal
 import stat
 import sys
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -23,7 +26,7 @@ from loguru import logger
 from bgate_unix.db import DedupeDatabase
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Generator, Iterator
 
 # Unix-only enforcement
 if sys.platform == "win32":
@@ -32,6 +35,9 @@ if sys.platform == "win32":
 # Constants
 FRINGE_SIZE = 64 * 1024  # 64KB for edge reads
 CHUNK_SIZE = 256 * 1024  # 256KB chunks for all storage types
+
+# Signal handling for critical sections
+_deferred_signal: tuple[int, object] | None = None
 
 
 class DedupeResult(Enum):
@@ -53,10 +59,62 @@ class ProcessResult:
     error: str | None = None
 
 
-def atomic_move(src: Path, dest: Path) -> None:
-    """Atomically move a file using link/unlink pattern.
+def _deferred_signal_handler(signum: int, frame: object) -> None:
+    """Store signal for later delivery after critical section completes."""
+    global _deferred_signal
+    _deferred_signal = (signum, frame)
 
-    os.link fails if dest exists, providing atomic overwrite protection.
+
+@contextmanager
+def critical_section() -> Generator[None, None, None]:
+    """Context manager that defers SIGINT/SIGTERM until critical I/O completes.
+
+    Ensures atomic_move operations complete fully before honoring interrupts.
+    """
+    global _deferred_signal
+    _deferred_signal = None
+
+    old_sigint = signal.signal(signal.SIGINT, _deferred_signal_handler)
+    old_sigterm = signal.signal(signal.SIGTERM, _deferred_signal_handler)
+
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, old_sigint)
+        signal.signal(signal.SIGTERM, old_sigterm)
+
+        if _deferred_signal is not None:
+            signum, frame = _deferred_signal
+            _deferred_signal = None
+            logger.warning("Deferred signal {} received, re-raising after critical section", signum)
+            # Re-raise the signal to the original handler
+            if signum == signal.SIGINT and old_sigint not in (signal.SIG_IGN, signal.SIG_DFL):
+                old_sigint(signum, frame)  # type: ignore[operator]
+            elif signum == signal.SIGTERM and old_sigterm not in (signal.SIG_IGN, signal.SIG_DFL):
+                old_sigterm(signum, frame)  # type: ignore[operator]
+            else:
+                # Default behavior - re-raise
+                signal.raise_signal(signum)
+
+
+def _fsync_dir(dir_path: Path) -> None:
+    """Sync a directory to ensure metadata changes are durable.
+
+    Critical for power-loss safety: without this, directory entry changes
+    (file moves) may not survive a crash even if the file data is written.
+    """
+    fd = os.open(dir_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_move(src: Path, dest: Path) -> None:
+    """Atomically move a file using link/unlink pattern with fsync.
+
+    Uses critical_section to defer signals until the move completes.
+    Ensures durability by syncing parent directories after the move.
 
     Args:
         src: Source file path.
@@ -67,16 +125,24 @@ def atomic_move(src: Path, dest: Path) -> None:
         OSError: If cross-device move attempted or other failure.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.link(src, dest)
-    except OSError as e:
-        if e.errno == errno.EXDEV:
-            raise OSError(
-                f"Cross-device move failed: {src} -> {dest}. "
-                "Source and destination must be on the same filesystem."
-            ) from e
-        raise
-    src.unlink()
+
+    with critical_section():
+        try:
+            os.link(src, dest)
+        except OSError as e:
+            if e.errno == errno.EXDEV:
+                raise OSError(
+                    f"Cross-device move failed: {src} -> {dest}. "
+                    "Source and destination must be on the same filesystem."
+                ) from e
+            raise
+
+        src.unlink()
+
+        # Sync parent directories to ensure durability
+        _fsync_dir(dest.parent)
+        if src.parent != dest.parent:
+            _fsync_dir(src.parent)
 
 
 def _compute_fringe_hash(file_path: Path, file_size: int) -> bytes:
@@ -395,12 +461,29 @@ class FileDeduplicator:
                 raise
 
         except Exception:
-            # Rollback file move on DB failure
+            # Rollback file move on DB failure - WITH journaling for durability
             if dest_path is not None and dest_path.exists():
+                rollback_journal_id: int | None = None
+                try:
+                    # Journal the rollback attempt
+                    rollback_journal_id = self._db.journal_move(
+                        str(dest_path), str(file_path), file_size
+                    )
+                    self._db.update_move_phase(rollback_journal_id, "moving")
+                    self._db.commit()
+                except Exception:
+                    rollback_journal_id = None
+
                 try:
                     atomic_move(dest_path, file_path)
+                    if rollback_journal_id is not None:
+                        with contextlib.suppress(Exception):
+                            self._db.update_move_phase(rollback_journal_id, "completed")
                 except OSError:
                     logger.warning("Failed to rollback file move: {} -> {}", dest_path, file_path)
+                    if rollback_journal_id is not None:
+                        with contextlib.suppress(Exception):
+                            self._db.update_move_phase(rollback_journal_id, "failed")
                     try:
                         self._db.add_orphan(str(file_path), str(dest_path), file_size)
                     except Exception:
@@ -414,20 +497,28 @@ class FileDeduplicator:
     ) -> None:
         """Write orphan info to emergency file when DB is unavailable.
 
-        Uses JSON for safe serialization (filenames can contain any character).
+        Uses JSONL for safe serialization and easy parsing by recovery scripts.
+        Includes metadata for debugging and manual recovery.
         """
+        import getpass
         import json
+        import socket
 
         emergency_file = self._db.db_path.parent / "emergency_orphans.jsonl"
         try:
             with emergency_file.open("a") as f:
                 record = {
                     "timestamp": datetime.now(UTC).isoformat(),
+                    "hostname": socket.gethostname(),
+                    "user": getpass.getuser(),
+                    "pid": os.getpid(),
                     "original_path": str(original_path),
                     "orphan_path": str(orphan_path),
                     "file_size": file_size,
+                    "db_path": str(self._db.db_path),
+                    "version": "0.2.0",
                 }
-                f.write(json.dumps(record) + "\n")
+                f.write(json.dumps(record, separators=(",", ":")) + "\n")
             logger.error("DB unavailable - wrote orphan to emergency file: {}", emergency_file)
         except OSError:
             logger.critical(
@@ -511,7 +602,8 @@ class FileDeduplicator:
     def _recover_from_journal(self) -> int:
         """Recover from incomplete journal entries.
 
-        Critical: Files in 'moving' state have been physically moved but NOT indexed.
+        Uses atomic operations to avoid TOCTOU races.
+        Files in 'moving' state have been physically moved but NOT indexed.
         We must move them back to source so they can be re-processed and properly indexed.
         """
         incomplete = self._db.get_incomplete_journal_entries()
@@ -528,38 +620,48 @@ class FileDeduplicator:
                 self._db.update_move_phase(journal_id, "failed")
                 recovered += 1
             elif phase == "moving":
-                # File was moved but index registration never completed.
-                # Must rollback to source for re-processing.
-                if dest.exists() and not source.exists():
+                # Attempt atomic rollback without exists() checks (TOCTOU-safe)
+                try:
+                    # Try to create hard link back to source
+                    os.link(dest, source)
+                    dest.unlink()
+                    _fsync_dir(source.parent)
+                    if dest.parent != source.parent:
+                        _fsync_dir(dest.parent)
+                    self._db.update_move_phase(journal_id, "failed")
+                    logger.info("Rolled back incomplete move: {} -> {}", dest, source)
+                    recovered += 1
+                except FileExistsError:
+                    # Source already exists - link() never completed or was interrupted
+                    # Safe to remove dest if it exists
                     try:
-                        atomic_move(dest, source)
-                        self._db.update_move_phase(journal_id, "failed")
-                        logger.info("Rolled back incomplete move: {} -> {}", dest, source)
-                        recovered += 1
-                    except OSError as e:
+                        dest.unlink()
+                        _fsync_dir(dest.parent)
+                    except FileNotFoundError:
+                        pass
+                    self._db.update_move_phase(journal_id, "failed")
+                    recovered += 1
+                except FileNotFoundError:
+                    # Dest doesn't exist - move never happened or manual cleanup
+                    self._db.update_move_phase(journal_id, "failed")
+                    recovered += 1
+                except OSError as e:
+                    if e.errno == errno.EXDEV:
+                        logger.error(
+                            "Cannot rollback cross-device move: {} -> {}. "
+                            "Manual intervention required.",
+                            dest,
+                            source,
+                        )
+                    else:
                         logger.error(
                             "Critical: Cannot rollback move {} -> {}: {}. "
-                            "File exists in processing_dir but is NOT indexed!",
+                            "File may exist in processing_dir but is NOT indexed!",
                             dest,
                             source,
                             e,
                         )
-                elif source.exists() and not dest.exists():
-                    # Move never happened - mark failed
-                    self._db.update_move_phase(journal_id, "failed")
-                    recovered += 1
-                elif source.exists() and dest.exists():
-                    # Partial state - remove dest, keep source
-                    try:
-                        dest.unlink()
-                        self._db.update_move_phase(journal_id, "failed")
-                        recovered += 1
-                    except OSError:
-                        logger.error("Cannot clean up partial move: {} -> {}", source, dest)
-                else:
-                    # Both missing - manual intervention occurred
-                    self._db.update_move_phase(journal_id, "failed")
-                    recovered += 1
+                    # Don't mark as failed - needs manual review
 
         return recovered
 
