@@ -26,6 +26,9 @@ share/python-wheels/
 *.egg
 MANIFEST
 
+# PyPI publishing
+~/.pypirc
+
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
@@ -190,6 +193,13 @@ cython_debug/
 
 # Ruff stuff:
 .ruff_cache/
+
+# bgate-unix specific
+*.db
+*.db-wal
+*.db-shm
+inbound/
+processing/
 
 # PyPI configuration file
 .pypirc
