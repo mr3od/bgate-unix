@@ -278,6 +278,7 @@ Performance benchmarks on production datasets demonstrate bgate-unix's efficienc
 - **Production-ready** performance for enterprise workloads
 - **Perfect idempotency** - no unnecessary operations on re-runs
 - **Effective deduplication** with 13.5% duplicate detection
+- **I/O optimized** - performance bottleneck is disk throughput, not CPU cycles (as designed)
 
 ### Running Benchmarks
 
