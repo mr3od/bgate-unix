@@ -31,10 +31,16 @@ console = Console()
 def setup_logging(verbose: bool, json_mode: bool = False) -> None:
     """Configure loguru for terminal output. Stderr for logs if JSON mode."""
     logger.remove()
-    level = "ERROR" if json_mode and not verbose else ("DEBUG" if verbose else "INFO")
+    level = "ERROR" if json_mode and not verbose else ("DEBUG" if verbose else "WARNING")
 
     logger.add(
-        RichHandler(rich_tracebacks=True, console=Console(stderr=True), show_time=False),
+        RichHandler(
+            rich_tracebacks=True,
+            console=Console(stderr=True),
+            show_time=False,
+            show_path=verbose,  # Hide path:line unless verbose
+            markup=False,  # CRITICAL FIX: Treat message as plain text
+        ),
         format="{message}",
         level=level,
     )
@@ -69,12 +75,18 @@ def scan(
         "dedupe.db"
     ),
     processing_dir: Annotated[
-        Path | None, typer.Option("--into", help="Move unique files into this directory.")
+        Path | None, typer.Option("--into", help="Directory to move unique files into.")
     ] = None,
-    recursive: Annotated[bool, typer.Option("--recursive", "-r", help="Recursive scan.")] = False,
-    dry_run: Annotated[
-        bool, typer.Option("--dry-run", help="Show what would happen without moving files.")
+    move: Annotated[
+        bool, typer.Option("--move", help="AUTHORIZE file moves. Default is dry-run (read-only).")
     ] = False,
+    recursive: Annotated[bool, typer.Option("--recursive", "-r", help="Recursive scan.")] = False,
+    tags: Annotated[
+        list[str] | None, typer.Option("--tag", help="Add metadata tags (format: key:value).")
+    ] = None,
+    ignore: Annotated[
+        list[str] | None, typer.Option("--ignore", "-i", help="Additional patterns to ignore.")
+    ] = None,
     json_output: Annotated[
         bool, typer.Option("--json", help="Output results in JSON format.")
     ] = False,
@@ -88,16 +100,39 @@ def scan(
             print(json.dumps({"error": f"Path {path} does not exist"}))
         else:
             console.print(
-                f"[bold red]Error:[/bold red] Path [yellow]{path}[/yellow] does not exist."
+                f'[bold red]Error:[/bold red] Path [yellow]"{path}"[/yellow] does not exist.'
             )
         raise typer.Exit(1)
 
-    if not json_output and dry_run:
-        console.print("[bold yellow]Dry run enabled. No files will be moved.[/bold yellow]\n")
+    # Parse tags
+    parsed_tags = {}
+    if tags:
+        for tag in tags:
+            if ":" not in tag:
+                if json_output:
+                    print(json.dumps({"error": f"Invalid tag format: {tag}. Use key:value"}))
+                else:
+                    console.print(
+                        f"[bold red]Error:[/bold red] Invalid tag format: {tag}. Use key:value"
+                    )
+                raise typer.Exit(1)
+            key, value = tag.split(":", 1)
+            parsed_tags[key.strip()] = value.strip()
+
+    # Safety logic: Default is dry-run unless --move is specified
+    is_dry_run = not move
+    active_processing_dir = processing_dir if move else None
+
+    if not json_output:
+        if is_dry_run and processing_dir:
+            console.print("[bold yellow]Dry Run Mode: No files will be moved.[/bold yellow]")
+            console.print("[dim]Pass --move to execute changes.[/dim]\n")
+        elif is_dry_run:
+            console.print(
+                "[bold yellow]Read-Only Mode: Scanning for duplicates only.[/bold yellow]\n"
+            )
 
     try:
-        active_processing_dir = None if dry_run else processing_dir
-
         with FileDeduplicator(db, processing_dir=active_processing_dir) as deduper:
             results = []
 
@@ -109,23 +144,29 @@ def scan(
                     console=console,
                     transient=True,
                 ) as progress:
-                    task = progress.add_task(f"Scanning {path}...", total=None)
+                    task = progress.add_task(f'Scanning "{path}"...', total=None)
 
                     if path.is_file():
-                        res = deduper.process_file(path)
+                        res = deduper.process_file(path, tags=parsed_tags)
                         results.append(res)
                     else:
-                        for result in deduper.process_directory(path, recursive=recursive):
+                        for result in deduper.process_directory(
+                            path, recursive=recursive, ignore_patterns=ignore, tags=parsed_tags
+                        ):
                             results.append(result)
                             progress.update(
                                 task,
-                                description=f"Scanning: [cyan]{result.original_path.name}[/cyan]",
+                                description=f'Scanning: [cyan]"{result.original_path.name}"[/cyan]',
                             )
             else:
                 if path.is_file():
-                    results.append(deduper.process_file(path))
+                    results.append(deduper.process_file(path, tags=parsed_tags))
                 else:
-                    results = list(deduper.process_directory(path, recursive=recursive))
+                    results = list(
+                        deduper.process_directory(
+                            path, recursive=recursive, ignore_patterns=ignore, tags=parsed_tags
+                        )
+                    )
 
             # Compile counts
             unique_list = [r for r in results if r.result == DedupeResult.UNIQUE]
@@ -147,6 +188,7 @@ def scan(
                             "result": r.result.value,
                             "tier": r.tier,
                             "duplicate_of": str(r.duplicate_of) if r.duplicate_of else None,
+                            "tags": r.tags if hasattr(r, "tags") else None,
                             "error": r.error,
                         }
                         for r in results
@@ -164,13 +206,13 @@ def scan(
 
                 console.print(table)
 
-                if dry_run and len(unique_list) > 0:
+                if is_dry_run and processing_dir and len(unique_list) > 0:
                     console.print(
-                        f"\n[bold yellow]Dry run summary:[/bold yellow] {len(unique_list)} files would be moved to {processing_dir}"
+                        f'\n[bold yellow]Dry run summary:[/bold yellow] {len(unique_list)} files would be moved to "{processing_dir}"'
                     )
                 elif processing_dir and len(unique_list) > 0:
                     console.print(
-                        f"\n[bold green]Success:[/bold green] {len(unique_list)} files moved to {processing_dir}"
+                        f'\n[bold green]Success:[/bold green] {len(unique_list)} files moved to "{processing_dir}"'
                     )
 
     except Exception as e:
