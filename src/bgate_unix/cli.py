@@ -63,6 +63,7 @@ def main(
 
 @app.command()
 def scan(
+    ctx: typer.Context,
     path: Annotated[Path, typer.Argument(help="File or directory to scan.")],
     db: Annotated[Path, typer.Option("--db", help="Path to SQLite index database.")] = Path(
         "dedupe.db"
@@ -77,7 +78,6 @@ def scan(
     json_output: Annotated[
         bool, typer.Option("--json", help="Output results in JSON format.")
     ] = False,
-    ctx: typer.Context | None = None,
 ) -> None:
     """Scan files for duplicates and optionally move unique files."""
     verbose = ctx.parent.params.get("verbose", False) if ctx and ctx.parent else False
@@ -212,13 +212,13 @@ def recover(
 
 @app.command()
 def stats(
+    ctx: typer.Context,
     db: Annotated[Path, typer.Option("--db", help="Path to SQLite index database.")] = Path(
         "dedupe.db"
     ),
     json_output: Annotated[
         bool, typer.Option("--json", help="Output results in JSON format.")
     ] = False,
-    ctx: typer.Context | None = None,
 ) -> None:
     """Show database statistics and index health."""
     verbose = ctx.parent.params.get("verbose", False) if ctx and ctx.parent else False
