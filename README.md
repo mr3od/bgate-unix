@@ -66,6 +66,21 @@ pip install bgate-unix
 
 **Requirements:** Unix-based OS (Linux, macOS, BSD). Windows is not supported.
 
+## CLI Usage
+
+`bgate-unix` provides a high-performance CLI for pipeline integration.
+
+```bash
+# Scan a directory and move unique files to vault
+bgate scan ./incoming --into ./vault --recursive
+
+# Show index statistics
+bgate stats --db dedupe.db
+
+# Recover from an interrupted session
+bgate recover --db dedupe.db
+```
+
 ## Quick Start
 
 ```python
