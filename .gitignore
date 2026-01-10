@@ -200,6 +200,8 @@ cython_debug/
 *.db-shm
 inbound/
 processing/
+tinker-companion/
+tinker.md
 
 # PyPI configuration file
 .pypirc
