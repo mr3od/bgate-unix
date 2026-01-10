@@ -916,7 +916,7 @@ class FileDeduplicator:
         bgateignore_path = directory / ".bgateignore"
         if bgateignore_path.exists():
             try:
-                with open(bgateignore_path, "r") as f:
+                with bgateignore_path.open() as f:
                     for line in f:
                         line = line.strip()
                         if line and not line.startswith("#"):

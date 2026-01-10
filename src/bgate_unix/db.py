@@ -88,6 +88,9 @@ class DedupeDatabase:
 
     def _migrate_schema(self, from_version: int) -> None:
         """Apply schema migrations."""
+        if self._db is None:
+            raise RuntimeError("Database not connected")
+
         if from_version < 4:
             # Add metadata column to full_index
             logger.info("Adding metadata column to full_index table")
@@ -242,6 +245,9 @@ class DedupeDatabase:
         return row[0] if row else None
 
     def add_full(self, full_hash: bytes, file_path: str, metadata: str | None = None) -> bool:
+        if self._db is None:
+            raise RuntimeError("Database not connected")
+
         cursor = self._db.execute(
             """
             INSERT INTO full_index (full_hash, file_path, metadata)
