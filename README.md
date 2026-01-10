@@ -141,7 +141,8 @@ bgate-unix is designed for **trusted internal pipelines**.
 ### Sharded Storage Layout
 
 Unique files are stored in a 2-level hex-sharded structure inside `processing_dir`:
-- Path: `{processing_dir}/{hash[0:2]}/{hash[2:16]}{original_suffix}`
+- Path: `{processing_dir}/{id[0:2]}/{id[2:16]}{original_suffix}`
+- Note: `id` is the full content hash when available (Tier 3), otherwise a unique UUID (Tier 1/2) to preserve "Move-then-Hash" performance.
 - Example: `processed/a3/bc4f91e2d0f8.pdf`
 
 ### Database Schema
