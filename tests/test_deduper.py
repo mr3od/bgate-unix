@@ -149,7 +149,7 @@ class TestDedupeDatabase:
     def test_schema_version(self, db_path: Path):
         """Schema version should be set correctly."""
         with DedupeDatabase(db_path) as db:
-            assert db.schema_version == 3
+            assert db.schema_version == 4
 
     def test_move_journal(self, db_path: Path):
         """Move journal operations should work correctly."""
@@ -390,7 +390,7 @@ class TestStats:
         stats = deduplicator.stats
         assert stats["unique_sizes"] == 2
         assert stats["full_entries"] == 2
-        assert stats["schema_version"] == 3
+        assert stats["schema_version"] == 4
         assert "pending_journal" in stats
 
 

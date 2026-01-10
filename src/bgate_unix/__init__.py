@@ -2,5 +2,5 @@
 
 from bgate_unix.engine import DedupeResult, FileDeduplicator, ProcessResult
 
-__version__ = "0.4.3"
+__version__ = "0.5.0"
 __all__ = ["DedupeResult", "FileDeduplicator", "ProcessResult"]

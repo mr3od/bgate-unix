@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 if sys.platform == "win32":
     sys.exit("bgate-unix is Unix-only. Windows is not supported.")
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 
 class DedupeDatabase:
@@ -68,17 +68,37 @@ class DedupeDatabase:
         self._db.execute("PRAGMA mmap_size = 268435456")
 
     def _enforce_schema_version(self) -> None:
-        """Hard-stop if schema version mismatch."""
-        version = self.schema_version
-        if version != CURRENT_SCHEMA_VERSION:
+        """Handle schema migrations and version enforcement."""
+        current_version = self.schema_version
+
+        if current_version < CURRENT_SCHEMA_VERSION:
+            logger.info(
+                "Migrating database from v{} to v{}", current_version, CURRENT_SCHEMA_VERSION
+            )
+            self._migrate_schema(current_version)
+        elif current_version > CURRENT_SCHEMA_VERSION:
             logger.error(
-                "Database schema version mismatch! "
+                "Database schema version is newer than supported! "
                 "Expected v{}, found v{}. "
-                "Please migrate the database or use a new one.",
+                "Please update bgate-unix or use a compatible database.",
                 CURRENT_SCHEMA_VERSION,
-                version,
+                current_version,
             )
             sys.exit(1)
+
+    def _migrate_schema(self, from_version: int) -> None:
+        """Apply schema migrations."""
+        if from_version < 4:
+            # Add metadata column to full_index
+            logger.info("Adding metadata column to full_index table")
+            self._db.execute("ALTER TABLE full_index ADD COLUMN metadata TEXT")
+
+        # Update schema version
+        self._db.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+            [CURRENT_SCHEMA_VERSION, datetime.now(UTC).isoformat()],
+        )
+        logger.info("Schema migration to v{} completed", CURRENT_SCHEMA_VERSION)
 
     def _create_schema(self) -> None:
         if self._db is None:
@@ -103,12 +123,13 @@ class DedupeDatabase:
                 ) WITHOUT ROWID
             """)
 
-        # Full hash index for Tier 3 (BLOB)
+        # Full hash index for Tier 3 (BLOB) with metadata
         if "full_index" not in self._db.table_names():
             self._db.execute("""
                 CREATE TABLE full_index (
                     full_hash BLOB PRIMARY KEY,
-                    file_path TEXT NOT NULL
+                    file_path TEXT NOT NULL,
+                    metadata TEXT
                 ) WITHOUT ROWID
             """)
 
@@ -220,14 +241,14 @@ class DedupeDatabase:
         ).fetchone()
         return row[0] if row else None
 
-    def add_full(self, full_hash: bytes, file_path: str) -> bool:
-        cursor = self.db.execute(
+    def add_full(self, full_hash: bytes, file_path: str, metadata: str | None = None) -> bool:
+        cursor = self._db.execute(
             """
-            INSERT INTO full_index (full_hash, file_path)
-            VALUES (?, ?)
+            INSERT INTO full_index (full_hash, file_path, metadata)
+            VALUES (?, ?, ?)
             ON CONFLICT DO NOTHING
             """,
-            [full_hash, file_path],
+            [full_hash, file_path, metadata],
         )
         return cursor.rowcount > 0
 

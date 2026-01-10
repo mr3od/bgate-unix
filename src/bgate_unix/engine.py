@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import json
 import os
 import signal
 import stat
@@ -35,6 +36,17 @@ if sys.platform == "win32":
 # Constants
 FRINGE_SIZE = 64 * 1024  # 64KB for edge reads
 CHUNK_SIZE = 256 * 1024  # 256KB chunks for all storage types
+DEFAULT_IGNORES = {
+    ".git",
+    "node_modules",
+    "vendor",
+    "__pycache__",
+    ".DS_Store",
+    ".venv",
+    "venv",
+    ".idea",
+    ".vscode",
+}
 
 # Signal handling for critical sections
 _deferred_signal: tuple[int, object] | None = None
@@ -58,6 +70,7 @@ class ProcessResult:
     tier: Literal[0, 1, 2, 3]
     stored_path: Path | None = None
     duplicate_of: Path | None = None
+    tags: dict[str, str] | None = None
     error: str | None = None
 
 
@@ -323,7 +336,10 @@ class FileDeduplicator:
             return False, str(e)
 
     def process_file(
-        self, file_path: Path | str, stat_result: os.stat_result | None = None
+        self,
+        file_path: Path | str,
+        stat_result: os.stat_result | None = None,
+        tags: dict[str, str] | None = None,
     ) -> ProcessResult:
         """Process a single file through the deduplication tiers."""
         self._ensure_connected()
@@ -351,7 +367,7 @@ class FileDeduplicator:
                 )
 
             file_size = stat_result.st_size if stat_result else file_path.stat().st_size
-            return self._process_file(file_path, file_size)
+            return self._process_file(file_path, file_size, tags)
 
         except OSError as e:
             logger.exception("OS error processing file: {}", file_path)
@@ -372,41 +388,61 @@ class FileDeduplicator:
                 error=str(e),
             )
 
-    def _process_file(self, file_path: Path, file_size: int) -> ProcessResult:
+    def _process_file(
+        self, file_path: Path, file_size: int, tags: dict[str, str] | None = None
+    ) -> ProcessResult:
         """Core processing logic."""
         # Tier 0: Skip empty files
         if file_size == 0:
             return ProcessResult(
-                path=file_path, original_path=file_path, result=DedupeResult.SKIPPED, tier=0
+                path=file_path,
+                original_path=file_path,
+                result=DedupeResult.SKIPPED,
+                tier=0,
+                tags=tags,
             )
 
         # Tier 1: Size uniqueness
         if not self._db.size_exists(file_size):
-            return self._register_unique(file_path, file_size, tier=1)
+            return self._register_unique(file_path, file_size, tier=1, tags=tags)
 
         # Tier 2: Fringe hash
         fringe_hash = _compute_fringe_hash(file_path, file_size)
         existing_fringe = self._db.fringe_lookup(fringe_hash, file_size)
 
         if existing_fringe is None:
-            return self._register_unique(file_path, file_size, fringe_hash, tier=2)
+            return self._register_unique(file_path, file_size, fringe_hash, tier=2, tags=tags)
 
         # Tier 3: Full hash - absolute identity
         full_hash = _compute_full_hash(file_path)
         existing_full = self._db.full_lookup(full_hash)
 
         if existing_full is None:
-            return self._register_unique(file_path, file_size, fringe_hash, full_hash, tier=3)
+            return self._register_unique(
+                file_path, file_size, fringe_hash, full_hash, tier=3, tags=tags
+            )
+
+        # Self-check: Prevent "duplicate of self" reports
+        existing_path = Path(existing_full)
+        if existing_path.resolve() == file_path.resolve():
+            return ProcessResult(
+                path=file_path,
+                original_path=file_path,
+                result=DedupeResult.UNIQUE,
+                tier=3,
+                stored_path=file_path,
+                tags=tags,
+            )
 
         # Duplicate found
-        duplicate_path = Path(existing_full)
-        logger.info("[{}] is a duplicate of [{}]", file_path, duplicate_path)
+        logger.info("[{}] is a duplicate of [{}]", file_path, existing_path)
         return ProcessResult(
             path=file_path,
             original_path=file_path,
             result=DedupeResult.DUPLICATE,
             tier=3,
-            duplicate_of=duplicate_path,
+            duplicate_of=existing_path,
+            tags=tags,
         )
 
     def _register_unique(
@@ -416,6 +452,7 @@ class FileDeduplicator:
         fringe_hash: bytes | None = None,
         full_hash: bytes | None = None,
         tier: Literal[1, 2, 3] = 1,
+        tags: dict[str, str] | None = None,
     ) -> ProcessResult:
         """Register a unique file in the database.
 
@@ -523,7 +560,8 @@ class FileDeduplicator:
                 self._db.add_fringe(fringe_hash, file_size, storage_path)
 
                 # 3d. Insert full hash - check strict uniqueness
-                if self._db.add_full(full_hash, storage_path):
+                metadata_json = json.dumps(tags) if tags else None
+                if self._db.add_full(full_hash, storage_path, metadata_json):
                     # Success
                     self._db.commit()
                 else:
@@ -552,6 +590,7 @@ class FileDeduplicator:
             result=DedupeResult.UNIQUE,
             tier=tier,
             stored_path=dest_path if self._processing_dir else None,
+            tags=tags,
         )
 
     def _handle_duplicate_conflict(
@@ -858,6 +897,8 @@ class FileDeduplicator:
         self,
         directory: Path | str,
         recursive: bool = True,
+        ignore_patterns: list[str] | None = None,
+        tags: dict[str, str] | None = None,
     ) -> Iterator[ProcessResult]:
         """Process all files in a directory."""
         self._ensure_connected()
@@ -866,21 +907,48 @@ class FileDeduplicator:
         if not directory.is_dir():
             raise ValueError(f"Not a directory: {directory}")
 
-        yield from self._process_directory_scandir(directory, recursive)
+        # Combine default ignores with user patterns
+        ignores = DEFAULT_IGNORES.copy()
+        if ignore_patterns:
+            ignores.update(ignore_patterns)
+
+        # Load .bgateignore if it exists
+        bgateignore_path = directory / ".bgateignore"
+        if bgateignore_path.exists():
+            try:
+                with open(bgateignore_path, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            ignores.add(line)
+            except Exception as e:
+                logger.warning("Failed to read .bgateignore: {}", e)
+
+        yield from self._process_directory_scandir(directory, recursive, ignores, tags)
 
     def _process_directory_scandir(
-        self, directory: Path, recursive: bool
+        self,
+        directory: Path,
+        recursive: bool,
+        ignores: set[str],
+        tags: dict[str, str] | None = None,
     ) -> Iterator[ProcessResult]:
         """Process directory using scandir for efficient stat access."""
         try:
             with os.scandir(directory) as entries:
                 for entry in entries:
+                    # Skip ignored files/directories early
+                    if entry.name in ignores:
+                        continue
+
                     try:
                         if entry.is_file(follow_symlinks=False):
                             stat_result = entry.stat(follow_symlinks=False)
-                            yield self.process_file(Path(entry.path), stat_result)
+                            yield self.process_file(Path(entry.path), stat_result, tags=tags)
                         elif recursive and entry.is_dir(follow_symlinks=False):
-                            yield from self._process_directory_scandir(Path(entry.path), recursive)
+                            yield from self._process_directory_scandir(
+                                Path(entry.path), recursive, ignores, tags
+                            )
                     except OSError as e:
                         logger.warning("Error accessing {}: {}", entry.path, e)
         except OSError as e:
