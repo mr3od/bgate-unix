@@ -248,6 +248,53 @@ On startup, the engine automatically recovers incomplete entries:
 - **`planned`**: Move never started → Marked as `failed`.
 - **`moving`**: File may have been moved but not yet indexed → Engine attempts atomic rollback (link back to source + fsync + unlink destination).
 
+## Benchmarks
+
+Performance benchmarks on production datasets demonstrate bgate-unix's efficiency for enterprise workloads.
+
+### Test Environment
+
+**Hardware:** AWS EC2 ARM64 instance  
+**Storage:** Amazon Elastic Block Store (NVMe SSD)  
+**OS:** Debian GNU/Linux (ARM64)  
+**Dataset:** 24.68 GB production data pipeline files  
+
+### Results
+
+| Metric | Value |
+|--------|-------|
+| **Dataset Size** | 24.68 GB, 9,174 files |
+| **Processing Time** | 274.96 seconds (~4.6 minutes) |
+| **Bandwidth** | 89.1 MB/sec |
+| **File Throughput** | 28.8 files/sec (moved) |
+| **Files Moved** | 7,932 unique files (23.92 GB) |
+| **Deduplication** | 13.5% duplicates found (1,242 files) |
+| **Idempotency** | ✅ 0 files moved on subsequent runs |
+
+### Performance Analysis
+
+- **Excellent bandwidth** on large datasets (89.1 MB/sec)
+- **Consistent throughput** across different file sizes
+- **Production-ready** performance for enterprise workloads
+- **Perfect idempotency** - no unnecessary operations on re-runs
+- **Effective deduplication** with 13.5% duplicate detection
+
+### Running Benchmarks
+
+Use the included benchmark script to test performance on your data:
+
+```bash
+# Run benchmark with idempotency test
+./scripts/benchmark.sh /path/to/source /path/to/vault
+
+# Example output:
+# 🚀 bgate-unix Move Operation Benchmark
+# FIRST RUN: 89.1 MB/sec, 7,932 files moved
+# IDEMPOTENCY TEST: ✅ 0 files moved (perfect idempotency)
+```
+
+**Note:** Source and vault must be on the same filesystem for atomic operations.
+
 ## Development
 
 ```bash
