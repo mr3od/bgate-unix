@@ -1,6 +1,6 @@
 [project]
 name = "bgate-unix"
-version = "0.4.2"
+version = "0.4.3"
 description = "High-performance Unix file deduplication engine with tiered short-circuit logic and xxHash128."
 readme = "README.md"
 license = { text = "MIT" }
