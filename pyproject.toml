@@ -1,6 +1,6 @@
 [project]
 name = "bgate-unix"
-version = "0.3.0"
+version = "0.4.0"
 description = "High-performance Unix file deduplication engine with tiered short-circuit logic and xxHash128."
 readme = "README.md"
 license = { text = "MIT" }
@@ -25,7 +25,12 @@ dependencies = [
     "xxhash>=3.4.0",
     "sqlite-utils>=3.35.0",
     "loguru>=0.7.0",
+    "typer>=0.21.1",
+    "rich>=14.2.0",
 ]
+
+[project.scripts]
+bgate = "bgate_unix.cli:app"
 
 [project.optional-dependencies]
 dev = [
