@@ -5,7 +5,6 @@ Exposes the deduplication engine to the shell with high-performance defaults.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Annotated
 
