@@ -39,6 +39,7 @@ Incoming File
 ┌─────────────────────────────────────────┐
 │  TIER 2: Fringe Hash (xxh64)            │
 │  First 64KB + Last 64KB + size          │
+│  (Last 64KB overlaps if file < 128KB)   │
 │  Hash not in DB → UNIQUE                │
 │  Cost: 128KB read max                   │
 └─────────────────────────────────────────┘
@@ -96,9 +97,11 @@ from bgate_unix import FileDeduplicator
 
 with FileDeduplicator("index.db", processing_dir=Path("processed/")) as deduper:
     for result in deduper.process_directory("inbound/", recursive=True):
-        if result.result.value == "unique":
-            # File has been moved to processed/
-            print(f"Moved: {result.path.name}")
+        if result.result == DedupeResult.UNIQUE:
+            # result.path is the new location in processed/
+            # result.original_path is the source location
+            # result.stored_path is also the new location (explicit field)
+            print(f"Moved: {result.original_path.name} -> {result.stored_path.name}")
 ```
 
 **Important:** `processing_dir` must be on the same filesystem as source files (required for atomic `os.link`).
@@ -119,32 +122,36 @@ with FileDeduplicator("index.db") as deduper:
     print(f"Stats: {deduper.stats}")
 ```
 
-### Orphan Recovery
+### Database & Recovery
 
-If a crash occurs during file moves, orphaned files are automatically recovered on next connect:
-
-```python
-with FileDeduplicator("index.db") as deduper:
-    # Automatic recovery happens in connect()
-    orphans = deduper.list_orphans()
-    print(f"Pending orphans: {len(orphans)}")
-```
+- **Strict Schema Enforcement**: Engines will hard-stop if a database version mismatch is detected.
+- **Orphan Recovery**: If a crash occurs during file moves, orphaned files are automatically recovered on next connect.
+- **Emergency Logging**: If the database becomes unavailable during a critical I/O operation, orphan records are written to an atomic `.jsonl` log file for manual recovery.
 
 ## Technical Details
 
-### Absolute Trust Model
+### Threat Model & Hashing
 
-bgate-unix uses xxHash128 for full content hashing. With 2^128 possible values, collisions are treated as mathematically impossible. If a hash exists in the database, the file is definitively a duplicate—no byte-by-byte verification needed.
+bgate-unix is designed for **trusted internal pipelines**.
+
+- **xxHash128**: Used as an extremely low-collision identifier for high-volume data (2^128 range). For trusted inputs, collisions are treated as mathematically impossible.
+- **Deduplication Priority**: Speed and durability are prioritized over security.
+- **Not for Adversarial Input**: If you are processing untrusted/malicious files where hash collisions could be intentionally engineered, use a cryptographically secure mode (like BLAKE3 or SHA-256) which may be added in future versions.
+
+### Sharded Storage Layout
+
+Unique files are stored in a 2-level hex-sharded structure inside `processing_dir`:
+- Path: `{processing_dir}/{hash[0:2]}/{hash[2:16]}{original_suffix}`
+- Example: `processed/a3/bc4f91e2d0f8.pdf`
 
 ### Database Schema
 
 SQLite with BLOB-based hash storage:
 
 ```sql
--- Tier 1: Size lookup
+-- Tier 1: Size lookup (existence set)
 CREATE TABLE size_index (
-    file_size INTEGER PRIMARY KEY,
-    count INTEGER NOT NULL
+    file_size INTEGER PRIMARY KEY
 ) WITHOUT ROWID;
 
 -- Tier 2: Fringe hash (BLOB)
@@ -160,25 +167,57 @@ CREATE TABLE full_index (
     full_hash BLOB PRIMARY KEY,
     file_path TEXT NOT NULL
 ) WITHOUT ROWID;
+
+-- Crash recovery tables
+CREATE TABLE orphan_registry (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    original_path TEXT NOT NULL,
+    orphan_path TEXT NOT NULL,
+    file_size INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    recovered_at TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    UNIQUE(orphan_path)
+);
+
+CREATE TABLE move_journal (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_path TEXT NOT NULL,
+    dest_path TEXT NOT NULL,
+    file_size INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    phase TEXT NOT NULL DEFAULT 'planned',
+    completed_at TEXT
+);
+
+CREATE TABLE schema_version (
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL
+);
 ```
 
 Pragmas: `WAL` mode, `synchronous=FULL`, 64MB cache, 256MB mmap.
 
 ### Atomic File Moves
 
-Uses Unix `os.link()` + `os.unlink()` pattern:
-- `os.link()` fails if destination exists (no overwrites)
-- `os.link()` fails across filesystems (`EXDEV` error)
-- Three-phase journaling: Journal → Move → Register
+Uses hard-link + unlink (`os.link` / `Path.unlink`) for atomic same-filesystem moves.
+
+#### Durability Guarantees
+- **Signal Deferral**: SIGINT/SIGTERM signals are deferred during critical move operations using `critical_section()`.
+- **Fsync Ordering**: File and directory durability is strictly enforced:
+  1. After linking destination, newly created parent directories are fsynced (top-down).
+  2. The destination directory is fsynced to persist the new link.
+  3. The source file is unlinked.
+  4. The source directory is fsynced to persist the removal.
+- **FS Enforcement**: Cross-device moves are explicitly rejected (`EXDEV` error) to maintain atomicity.
 
 ### Crash Recovery
 
-Move operations are journaled before execution:
-1. **Journal intent** (committed transaction)
-2. **Perform move** (outside transaction)
-3. **Register in index** (committed transaction)
+Move operations use phase-based journaling: `planned → moving → completed`.
 
-On startup, incomplete journal entries are recovered automatically.
+On startup, the engine automatically recovers incomplete entries:
+- **`planned`**: Move never started → Marked as `failed`.
+- **`moving`**: File may have been moved but not yet indexed → Engine attempts atomic rollback (link back to source + fsync + unlink destination).
 
 ## Development
 

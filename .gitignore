@@ -215,4 +215,7 @@ processing/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
-tinker-companion
+
+.repomix/bundles.json
+repomix-output.*.xml
+prompts/*.md

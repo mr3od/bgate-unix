@@ -53,8 +53,10 @@ class ProcessResult:
     """Result of processing a single file."""
 
     path: Path
+    original_path: Path
     result: DedupeResult
     tier: Literal[0, 1, 2, 3]
+    stored_path: Path | None = None
     duplicate_of: Path | None = None
     error: str | None = None
 
@@ -111,10 +113,11 @@ def _fsync_dir(dir_path: Path) -> None:
 
 
 def atomic_move(src: Path, dest: Path) -> None:
-    """Atomically move a file using link/unlink pattern with fsync.
+    """Atomically move file with full directory durability.
 
     Uses critical_section to defer signals until the move completes.
-    Ensures durability by syncing parent directories after the move.
+    Ensures durability by syncing the parent of every newly created directory
+    in the path, plus the destination and source directories.
 
     Args:
         src: Source file path.
@@ -124,9 +127,24 @@ def atomic_move(src: Path, dest: Path) -> None:
         FileExistsError: If destination already exists.
         OSError: If cross-device move attempted or other failure.
     """
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    parent = dest.parent
+
+    # 1. Detect which directories need creation outside critical section
+    dirs_to_sync_parents_of: list[Path] = []
+    curr = parent
+    while not curr.exists():
+        dirs_to_sync_parents_of.append(curr)
+        prev = curr
+        curr = curr.parent
+        # Robust root check: stop if we hit root or can't go higher
+        if curr == prev:
+            break
 
     with critical_section():
+        # 2. Create directories (inside critical section to prevent partial state on SIGINT)
+        if dirs_to_sync_parents_of:
+            parent.mkdir(parents=True, exist_ok=True)
+
         try:
             os.link(src, dest)
         except OSError as e:
@@ -137,22 +155,32 @@ def atomic_move(src: Path, dest: Path) -> None:
                 ) from e
             raise
 
+        # 3. Durability: Sync parent of every new directory
+        # CRITICAL: Do NOT suppress errors here. If we can't persist the directory structure,
+        # we must not proceed to unlink the source.
+        for d in reversed(dirs_to_sync_parents_of):
+            _fsync_dir(d.parent)
+
+        # 4. Sync dest directory (to persist the file link)
+        _fsync_dir(parent)
+
+        # 5. Remove source
         src.unlink()
 
-        # Sync parent directories to ensure durability
-        _fsync_dir(dest.parent)
-        if src.parent != dest.parent:
-            _fsync_dir(src.parent)
+        # 6. Sync source directory to ensure unlink is durable
+        _fsync_dir(src.parent)
 
 
-def _compute_fringe_hash(file_path: Path, file_size: int) -> bytes:
+def _compute_fringe_hash(file_path: Path, _file_size: int = 0) -> bytes:
     """Compute fringe hash from file edges.
 
-    Reads first 64KB, and if file > 64KB, also reads last 64KB (non-overlapping).
+    Reads first 64KB, and if file > 64KB, also reads last 64KB.
+    If file size is between 64KB and 128KB, the chunks will overlap.
+    Uses actual file size from the open file descriptor to avoid TOCTOU issues.
 
     Args:
         file_path: Path to file.
-        file_size: Size of file in bytes.
+        _file_size: Deprecated, kept for API compatibility. Actual size from FD is used.
 
     Returns:
         Raw 8-byte digest from xxh64.
@@ -161,15 +189,22 @@ def _compute_fringe_hash(file_path: Path, file_size: int) -> bytes:
 
     try:
         with file_path.open("rb") as f:
+            # Get authoritative size from file descriptor to avoid TOCTOU
+            actual_size = f.seek(0, os.SEEK_END)
+            f.seek(0)
+
             first_chunk = f.read(FRINGE_SIZE)
             hasher.update(first_chunk)
 
-            if file_size > FRINGE_SIZE:
-                f.seek(-min(FRINGE_SIZE, file_size - FRINGE_SIZE), os.SEEK_END)
-                last_chunk = f.read()
+            if actual_size > FRINGE_SIZE:
+                # Overlap allowed spec: always read last 64KB (even if overlapping)
+                seek_pos = max(0, actual_size - FRINGE_SIZE)
+                f.seek(seek_pos)
+                last_chunk = f.read(FRINGE_SIZE)
                 hasher.update(last_chunk)
 
-            hasher.update(file_size.to_bytes(8, "little"))
+            # Use actual size from FD, not the passed estimate
+            hasher.update(actual_size.to_bytes(8, "little"))
     except OSError as e:
         raise OSError(f"Failed to read file for fringe hash: {file_path}") from e
 
@@ -298,6 +333,7 @@ class FileDeduplicator:
             if not file_path.exists():
                 return ProcessResult(
                     path=file_path,
+                    original_path=file_path,
                     result=DedupeResult.SKIPPED,
                     tier=0,
                     error="File does not exist",
@@ -308,6 +344,7 @@ class FileDeduplicator:
                 logger.warning("Path validation failed for {}: {}", file_path, error)
                 return ProcessResult(
                     path=file_path,
+                    original_path=file_path,
                     result=DedupeResult.SKIPPED,
                     tier=0,
                     error=f"Validation failed: {error}",
@@ -320,6 +357,7 @@ class FileDeduplicator:
             logger.exception("OS error processing file: {}", file_path)
             return ProcessResult(
                 path=file_path,
+                original_path=file_path,
                 result=DedupeResult.SKIPPED,
                 tier=0,
                 error=str(e),
@@ -328,6 +366,7 @@ class FileDeduplicator:
             logger.exception("Error processing file: {}", file_path)
             return ProcessResult(
                 path=file_path,
+                original_path=file_path,
                 result=DedupeResult.SKIPPED,
                 tier=0,
                 error=str(e),
@@ -337,7 +376,9 @@ class FileDeduplicator:
         """Core processing logic."""
         # Tier 0: Skip empty files
         if file_size == 0:
-            return ProcessResult(path=file_path, result=DedupeResult.SKIPPED, tier=0)
+            return ProcessResult(
+                path=file_path, original_path=file_path, result=DedupeResult.SKIPPED, tier=0
+            )
 
         # Tier 1: Size uniqueness
         if not self._db.size_exists(file_size):
@@ -362,6 +403,7 @@ class FileDeduplicator:
         logger.info("[{}] is a duplicate of [{}]", file_path, duplicate_path)
         return ProcessResult(
             path=file_path,
+            original_path=file_path,
             result=DedupeResult.DUPLICATE,
             tier=3,
             duplicate_of=duplicate_path,
@@ -390,17 +432,23 @@ class FileDeduplicator:
         if self._processing_dir:
             # Phase 1: Journal the intent
             for attempt in range(max_retries):
+                # v0.3.0 Sharding: 2-level hex (e.g. processing/aa/bbcc...)
                 if full_hash is not None:
-                    unique_name = f"{full_hash.hex()[:16]}{file_path.suffix}"
+                    hex_val = full_hash.hex()
+                    shard = hex_val[:2]
+                    unique_name = f"{hex_val[2:16]}{file_path.suffix}"
                 else:
-                    unique_name = f"{uuid.uuid4().hex[:16]}{file_path.suffix}"
+                    hex_val = uuid.uuid4().hex
+                    shard = hex_val[:2]
+                    unique_name = f"{hex_val[2:16]}{file_path.suffix}"
 
                 if attempt > 0:
                     unique_name = (
                         f"{Path(unique_name).stem}_{uuid.uuid4().hex[:8]}{file_path.suffix}"
                     )
 
-                dest_path = self._processing_dir / unique_name
+                dest_dir = self._processing_dir / shard
+                dest_path = dest_dir / unique_name
 
                 self._db.begin_transaction()
                 try:
@@ -413,6 +461,23 @@ class FileDeduplicator:
 
                 # Phase 2: File move (outside transaction)
                 try:
+                    # Durable shard creation: atomic_move will create parents, but we want to ensure
+                    # the shard directory entry itself is durable in the processing_dir.
+                    # Performance: Only fsync processing_dir if we ACTUALLY created a new shard dir.
+                    try:
+                        dest_dir.mkdir(exist_ok=False)
+                        # New directory created - must sync parent to ensure entry is durable
+                        _fsync_dir(self._processing_dir)
+                    except FileExistsError:
+                        # Directory already exists - no parent sync needed
+                        pass
+                    except OSError as e:
+                        # CRITICAL: If mkdir fails unexpectedly (e.g. permission), we must NOT
+                        # fall back to atomic_move because we haven't synced the parent directory.
+                        # We must "fail fast" to ensure durability guarantees.
+                        logger.error("Shard pre-create failed for {}: {}", dest_dir, e)
+                        raise
+
                     atomic_move(file_path, dest_path)
                     break
                 except FileExistsError:
@@ -440,64 +505,140 @@ class FileDeduplicator:
 
         # Phase 3: Register in index
         try:
+            conflict_detected = False
             self._db.begin_transaction()
             try:
+                # 3a. Update journal if needed
                 if journal_id is not None:
                     self._db.update_move_phase(journal_id, "completed")
 
+                # 3b. Calculate hashes if missing (idempotent)
                 if fringe_hash is None:
                     fringe_hash = _compute_fringe_hash(Path(storage_path), file_size)
-
                 if full_hash is None:
                     full_hash = _compute_full_hash(Path(storage_path))
 
+                # 3c. Insert shared metadata
                 self._db.add_size(file_size)
                 self._db.add_fringe(fringe_hash, file_size, storage_path)
-                self._db.add_full(full_hash, storage_path)
 
-                self._db.commit()
+                # 3d. Insert full hash - check strict uniqueness
+                if self._db.add_full(full_hash, storage_path):
+                    # Success
+                    self._db.commit()
+                else:
+                    # Conflict: prevent commit, rollback this transaction fully
+                    self._db.rollback()
+                    conflict_detected = True
+
             except Exception:
                 self._db.rollback()
                 raise
 
-        except Exception:
-            # Rollback file move on DB failure - WITH journaling for durability
-            if dest_path is not None and dest_path.exists():
-                rollback_journal_id: int | None = None
-                try:
-                    # Journal the rollback attempt
-                    rollback_journal_id = self._db.journal_move(
-                        str(dest_path), str(file_path), file_size
-                    )
-                    self._db.update_move_phase(rollback_journal_id, "moving")
-                    self._db.commit()
-                except Exception:
-                    rollback_journal_id = None
+            # Handle conflict OUTSIDE the transaction block
+            if conflict_detected:
+                return self._handle_duplicate_conflict(
+                    file_path, dest_path, full_hash, file_size, journal_id
+                )
 
-                try:
-                    atomic_move(dest_path, file_path)
-                    if rollback_journal_id is not None:
-                        with contextlib.suppress(Exception):
-                            self._db.update_move_phase(rollback_journal_id, "completed")
-                except OSError:
-                    logger.warning("Failed to rollback file move: {} -> {}", dest_path, file_path)
-                    if rollback_journal_id is not None:
-                        with contextlib.suppress(Exception):
-                            self._db.update_move_phase(rollback_journal_id, "failed")
-                    try:
-                        self._db.add_orphan(str(file_path), str(dest_path), file_size)
-                    except Exception:
-                        self._write_emergency_orphan(file_path, dest_path, file_size)
+        except Exception:
+            # DB failure fallback (e.g. connection lost during begin_transaction)
+            self._handle_move_rollback(file_path, dest_path, file_size, journal_id)
             raise
 
-        return ProcessResult(path=file_path, result=DedupeResult.UNIQUE, tier=tier)
+        return ProcessResult(
+            path=dest_path if dest_path else file_path,
+            original_path=file_path,
+            result=DedupeResult.UNIQUE,
+            tier=tier,
+            stored_path=dest_path if self._processing_dir else None,
+        )
+
+    def _handle_duplicate_conflict(
+        self,
+        file_path: Path,
+        dest_path: Path | None,
+        full_hash: bytes,
+        file_size: int,
+        original_journal_id: int | None = None,
+    ) -> ProcessResult:
+        """Handle race condition where file became duplicate during move."""
+        # 4a. Move file back to source (rollback the move)
+        self._handle_move_rollback(file_path, dest_path, file_size, original_journal_id)
+
+        # 4b. Register as duplicate
+        existing_path = self._db.full_lookup(full_hash)
+        return ProcessResult(
+            path=file_path,
+            original_path=file_path,
+            result=DedupeResult.DUPLICATE,
+            tier=3,
+            duplicate_of=Path(existing_path) if existing_path else None,
+        )
+
+    def _handle_move_rollback(
+        self,
+        file_path: Path,
+        dest_path: Path | None,
+        file_size: int,
+        original_journal_id: int | None = None,
+    ) -> None:
+        """Rollback a file move: move dest back to source."""
+        if dest_path and dest_path.exists():
+            # Create a NEW journal entry for the rollback move
+            # This ensures the rollback itself is crash-safe
+            rollback_journal_id: int | None = None
+            self._db.begin_transaction()
+            try:
+                rollback_journal_id = self._db.journal_move(
+                    str(dest_path), str(file_path), file_size
+                )
+                self._db.update_move_phase(rollback_journal_id, "moving")
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                rollback_journal_id = None
+
+            try:
+                atomic_move(dest_path, file_path)
+                if rollback_journal_id is not None:
+                    self._db.begin_transaction()
+                    try:
+                        self._db.update_move_phase(rollback_journal_id, "completed")
+                        self._db.commit()
+                    except Exception:
+                        self._db.rollback()
+            except OSError:
+                logger.warning("Failed to rollback file move: {} -> {}", dest_path, file_path)
+                if rollback_journal_id is not None:
+                    self._db.begin_transaction()
+                    try:
+                        self._db.update_move_phase(rollback_journal_id, "failed")
+                        self._db.commit()
+                    except Exception:
+                        self._db.rollback()
+                try:
+                    self._db.add_orphan(str(file_path), str(dest_path), file_size)
+                except Exception:
+                    self._write_emergency_orphan(file_path, dest_path, file_size)
+
+        # After attempting rollback, mark the ORIGINAL journal entry as failed
+        # This prevents it from being stuck in "moving" state
+        if original_journal_id is not None:
+            try:
+                self._db.begin_transaction()
+                self._db.update_move_phase(original_journal_id, "failed")
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                pass
 
     def _write_emergency_orphan(
         self, original_path: Path, orphan_path: Path, file_size: int
     ) -> None:
         """Write orphan info to emergency file when DB is unavailable.
 
-        Uses JSONL for safe serialization and easy parsing by recovery scripts.
+        Uses unbuffered I/O with O_APPEND for atomic writes and fsync for durability.
         Includes metadata for debugging and manual recovery.
         """
         import getpass
@@ -506,19 +647,25 @@ class FileDeduplicator:
 
         emergency_file = self._db.db_path.parent / "emergency_orphans.jsonl"
         try:
-            with emergency_file.open("a") as f:
-                record = {
-                    "timestamp": datetime.now(UTC).isoformat(),
-                    "hostname": socket.gethostname(),
-                    "user": getpass.getuser(),
-                    "pid": os.getpid(),
-                    "original_path": str(original_path),
-                    "orphan_path": str(orphan_path),
-                    "file_size": file_size,
-                    "db_path": str(self._db.db_path),
-                    "version": "0.2.0",
-                }
-                f.write(json.dumps(record, separators=(",", ":")) + "\n")
+            record = {
+                "timestamp": datetime.now(UTC).isoformat(),
+                "hostname": socket.gethostname(),
+                "user": getpass.getuser(),
+                "pid": os.getpid(),
+                "original_path": str(original_path),
+                "orphan_path": str(orphan_path),
+                "file_size": file_size,
+                "db_path": str(self._db.db_path),
+                "version": "0.3.0",
+            }
+            # Use unbuffered I/O with O_APPEND for atomic single-syscall writes
+            fd = os.open(emergency_file, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+            try:
+                os.write(fd, (json.dumps(record, separators=(",", ":")) + "\n").encode())
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            _fsync_dir(emergency_file.parent)
             logger.error("DB unavailable - wrote orphan to emergency file: {}", emergency_file)
         except OSError:
             logger.critical(
@@ -535,7 +682,8 @@ class FileDeduplicator:
             emergency_file = self._db.db_path.parent / filename
             if emergency_file.exists():
                 try:
-                    line_count = sum(1 for _ in emergency_file.open())
+                    with emergency_file.open("r") as f:
+                        line_count = sum(1 for _ in f)
                     logger.warning(
                         "Emergency orphans file found at {} with {} entries",
                         emergency_file,
@@ -588,11 +736,26 @@ class FileDeduplicator:
 
             if not remaining_lines and imported > 0:
                 emergency_file.unlink()
+                _fsync_dir(emergency_file.parent)
                 logger.info("Removed emergency orphans file after successful import")
             elif remaining_lines:
-                with emergency_file.open("w") as f:
+                # Performance: batch write all lines, flush once, fsync once
+                # Safety (Opus Fix): Use atomic temp file -> rename to avoid partial writes
+                temp_file = emergency_file.with_suffix(".tmp")
+                with temp_file.open("w") as f:
                     for line in remaining_lines:
                         f.write(line + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                # Sync directory for temp file creation
+                _fsync_dir(temp_file.parent)
+
+                # Atomic replace
+                temp_file.replace(emergency_file)
+
+                # Sync directory for replace
+                _fsync_dir(emergency_file.parent)
 
         except OSError as e:
             logger.error("Failed to import emergency orphans: {}", e)
@@ -617,33 +780,59 @@ class FileDeduplicator:
 
             if phase == "planned":
                 # Move never started - just mark as failed
-                self._db.update_move_phase(journal_id, "failed")
+                self._db.begin_transaction()
+                try:
+                    self._db.update_move_phase(journal_id, "failed")
+                    self._db.commit()
+                except Exception:
+                    self._db.rollback()
                 recovered += 1
             elif phase == "moving":
                 # Attempt atomic rollback without exists() checks (TOCTOU-safe)
                 try:
                     # Try to create hard link back to source
                     os.link(dest, source)
-                    dest.unlink()
+                    # CRITICAL: Sync source directory BEFORE unlinking dest
                     _fsync_dir(source.parent)
-                    if dest.parent != source.parent:
+                    dest.unlink()
+                    with contextlib.suppress(FileNotFoundError, OSError):
                         _fsync_dir(dest.parent)
-                    self._db.update_move_phase(journal_id, "failed")
+
+                    self._db.begin_transaction()
+                    try:
+                        self._db.update_move_phase(journal_id, "failed")
+                        self._db.commit()
+                    except Exception:
+                        self._db.rollback()
+
                     logger.info("Rolled back incomplete move: {} -> {}", dest, source)
                     recovered += 1
                 except FileExistsError:
                     # Source already exists - link() never completed or was interrupted
                     # Safe to remove dest if it exists
-                    try:
+                    with contextlib.suppress(FileNotFoundError):
                         dest.unlink()
+                    # Sync dest parent if it exists
+                    with contextlib.suppress(FileNotFoundError, OSError):
                         _fsync_dir(dest.parent)
-                    except FileNotFoundError:
-                        pass
-                    self._db.update_move_phase(journal_id, "failed")
+
+                    self._db.begin_transaction()
+                    try:
+                        self._db.update_move_phase(journal_id, "failed")
+                        self._db.commit()
+                    except Exception:
+                        self._db.rollback()
+
                     recovered += 1
                 except FileNotFoundError:
                     # Dest doesn't exist - move never happened or manual cleanup
-                    self._db.update_move_phase(journal_id, "failed")
+                    self._db.begin_transaction()
+                    try:
+                        self._db.update_move_phase(journal_id, "failed")
+                        self._db.commit()
+                    except Exception:
+                        self._db.rollback()
+
                     recovered += 1
                 except OSError as e:
                     if e.errno == errno.EXDEV:

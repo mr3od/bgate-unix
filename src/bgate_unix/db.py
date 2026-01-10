@@ -1,7 +1,7 @@
 """Database schema and connection management for bgate-unix.
 
 Uses sqlite-utils for schema management and BLOB-based hash storage.
-Schema v2 only - no backward compatibility.
+Schema v3 - implements mandatory schema_version tracking.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 if sys.platform == "win32":
     sys.exit("bgate-unix is Unix-only. Windows is not supported.")
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 class DedupeDatabase:
@@ -39,8 +39,18 @@ class DedupeDatabase:
         """Establish database connection and initialize schema."""
         self._db = Database(self._db_path)
         self._apply_pragmas()
-        self._check_schema_compatibility()
+
+        # Safety: Check for legacy tables without version tracking
+        tables = self._db.table_names()
+        if tables and "schema_version" not in tables:
+            logger.error(
+                "Legacy or incompatible database detected (missing schema_version). "
+                "Manual migration or a fresh database is required."
+            )
+            sys.exit(1)
+
         self._create_schema()
+        self._enforce_schema_version()
 
     def _apply_pragmas(self) -> None:
         if self._db is None:
@@ -57,19 +67,18 @@ class DedupeDatabase:
         self._db.execute("PRAGMA temp_store = MEMORY")
         self._db.execute("PRAGMA mmap_size = 268435456")
 
-    def _check_schema_compatibility(self) -> None:
-        """Hard-stop if old incompatible schema detected."""
-        if self._db is None:
-            return
-        if "full_index" in self._db.table_names():
-            cols = [c.name for c in self._db["full_index"].columns]
-            if "full_hash" not in cols:
-                logger.error(
-                    "Incompatible database schema detected. "
-                    "This version requires BLOB-based full_index. "
-                    "Please migrate or use a new database."
-                )
-                sys.exit(1)
+    def _enforce_schema_version(self) -> None:
+        """Hard-stop if schema version mismatch."""
+        version = self.schema_version
+        if version != CURRENT_SCHEMA_VERSION:
+            logger.error(
+                "Database schema version mismatch! "
+                "Expected v{}, found v{}. "
+                "Please migrate the database or use a new one.",
+                CURRENT_SCHEMA_VERSION,
+                version,
+            )
+            sys.exit(1)
 
     def _create_schema(self) -> None:
         if self._db is None:
@@ -79,8 +88,7 @@ class DedupeDatabase:
         if "size_index" not in self._db.table_names():
             self._db.execute("""
                 CREATE TABLE size_index (
-                    file_size INTEGER PRIMARY KEY,
-                    count INTEGER NOT NULL DEFAULT 1
+                    file_size INTEGER PRIMARY KEY
                 ) WITHOUT ROWID
             """)
 
@@ -114,7 +122,8 @@ class DedupeDatabase:
                     file_size INTEGER NOT NULL,
                     created_at TEXT NOT NULL,
                     recovered_at TEXT,
-                    status TEXT NOT NULL DEFAULT 'pending'
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    UNIQUE(orphan_path)
                 )
             """)
 
@@ -181,10 +190,7 @@ class DedupeDatabase:
 
     def add_size(self, file_size: int) -> None:
         self.db.execute(
-            """
-            INSERT INTO size_index (file_size, count) VALUES (?, 1)
-            ON CONFLICT(file_size) DO UPDATE SET count = count + 1
-            """,
+            "INSERT OR IGNORE INTO size_index (file_size) VALUES (?)",
             [file_size],
         )
 
@@ -231,14 +237,19 @@ class DedupeDatabase:
 
     # Orphan registry
     def add_orphan(self, original_path: str, orphan_path: str, file_size: int) -> int:
-        cursor = self.db.execute(
+        self.db.execute(
             """
             INSERT INTO orphan_registry (original_path, orphan_path, file_size, created_at, status)
             VALUES (?, ?, ?, ?, 'pending')
+            ON CONFLICT(orphan_path) DO NOTHING
             """,
             [original_path, orphan_path, file_size, datetime.now(UTC).isoformat()],
         )
-        return cursor.lastrowid or 0
+        # Fetch the ID (either newly inserted or existing) to ensure idempotency
+        row = self.db.execute(
+            "SELECT id FROM orphan_registry WHERE orphan_path = ?", [orphan_path]
+        ).fetchone()
+        return row[0] if row else 0
 
     def update_orphan_status(self, orphan_id: int, status: str) -> None:
         recovered_at = datetime.now(UTC).isoformat() if status != "pending" else None
@@ -316,15 +327,15 @@ class DedupeDatabase:
 
     def begin_transaction(self) -> None:
         conn = self.db.conn
-        if conn is not None:
+        if conn is not None and not conn.in_transaction:
             conn.execute("BEGIN IMMEDIATE")
 
     def commit(self) -> None:
         conn = self.db.conn
-        if conn is not None:
+        if conn is not None and conn.in_transaction:
             conn.execute("COMMIT")
 
     def rollback(self) -> None:
         conn = self.db.conn
-        if conn is not None:
+        if conn is not None and conn.in_transaction:
             conn.execute("ROLLBACK")

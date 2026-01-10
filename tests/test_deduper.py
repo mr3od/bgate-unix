@@ -102,7 +102,7 @@ class TestAtomicMove:
         dest = temp_dir / "dest.txt"
         src.write_text("test content")
 
-        def mock_link(src_path, dest_path):
+        def mock_link(_src_path, _dest_path):
             raise OSError(errno.EXDEV, "Cross-device link")
 
         monkeypatch.setattr("os.link", mock_link)
@@ -149,7 +149,7 @@ class TestDedupeDatabase:
     def test_schema_version(self, db_path: Path):
         """Schema version should be set correctly."""
         with DedupeDatabase(db_path) as db:
-            assert db.schema_version == 2
+            assert db.schema_version == 3
 
     def test_move_journal(self, db_path: Path):
         """Move journal operations should work correctly."""
@@ -304,7 +304,7 @@ class TestProcessingDirectory:
 
             assert result.result == DedupeResult.UNIQUE
             assert not src_file.exists()
-            files_in_processing = list(processing_dir.iterdir())
+            files_in_processing = [p for p in processing_dir.rglob("*") if p.is_file()]
             assert len(files_in_processing) == 1
             assert files_in_processing[0].suffix == ".txt"
 
@@ -335,7 +335,7 @@ class TestProcessingDirectory:
             file2.write_bytes(os.urandom(100))
             deduper.process_file(file2)
 
-            files_in_processing = list(processing_dir.iterdir())
+            files_in_processing = [p for p in processing_dir.rglob("*") if p.is_file()]
             assert len(files_in_processing) == 2
             assert all(f.suffix == ".txt" for f in files_in_processing)
 
@@ -390,7 +390,7 @@ class TestStats:
         stats = deduplicator.stats
         assert stats["unique_sizes"] == 2
         assert stats["full_entries"] == 2
-        assert stats["schema_version"] == 2
+        assert stats["schema_version"] == 3
         assert "pending_journal" in stats
 
 
