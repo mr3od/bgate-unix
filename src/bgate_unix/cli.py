@@ -39,7 +39,7 @@ def setup_logging(verbose: bool, json_mode: bool = False) -> None:
             console=Console(stderr=True),
             show_time=False,
             show_path=verbose,  # Hide path:line unless verbose
-            markup=True,
+            markup=False,  # CRITICAL FIX: Treat message as plain text
         ),
         format="{message}",
         level=level,
