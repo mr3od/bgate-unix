@@ -15,6 +15,7 @@ from rich.logging import RichHandler
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from rich.table import Table
 
+from bgate_unix import __version__
 from bgate_unix.engine import DedupeResult, FileDeduplicator
 
 app = typer.Typer(
@@ -37,9 +38,22 @@ def setup_logging(verbose: bool) -> None:
     )
 
 
+def version_callback(value: bool):
+    """Print the version and exit."""
+    if value:
+        console.print(f"bgate-unix v{__version__}")
+        raise typer.Exit()
+
+
 @app.callback()
 def main(
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Enable debug logging.")] = False,
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version", callback=version_callback, is_eager=True, help="Show version and exit."
+        ),
+    ] = False,
 ) -> None:
     """Fingerprinting gatekeeper for high-volume Unix pipelines."""
     setup_logging(verbose)

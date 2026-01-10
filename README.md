@@ -2,6 +2,7 @@
 
 High-performance Unix file deduplication engine with tiered short-circuit logic.
 
+[![PyPI](https://img.shields.io/pypi/v/bgate-unix.svg)](https://pypi.org/project/bgate-unix/)
 [![CI](https://github.com/mr3od/bgate-unix/actions/workflows/ci.yml/badge.svg)](https://github.com/mr3od/bgate-unix/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -82,6 +83,18 @@ bgate recover --db dedupe.db
 ```
 
 ## Quick Start
+
+### As a CLI tool
+
+```bash
+# Install
+pip install bgate-unix
+
+# Scan and move unique files to tiered storage
+bgate scan ./incoming --into ./vault --recursive
+```
+
+### As a Library
 
 ```python
 from pathlib import Path

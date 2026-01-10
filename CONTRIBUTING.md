@@ -84,9 +84,11 @@ bgate-unix/
 ├── src/bgate_unix/      # Main package
 │   ├── __init__.py
 │   ├── engine.py        # Core deduplication logic
-│   └── db.py            # Database layer
+│   ├── db.py            # Database layer
+│   └── cli.py           # Typer CLI implementation
 ├── tests/
-│   └── test_deduper.py
+│   ├── test_durability.py
+│   └── test_perf_correctness.py
 ├── pyproject.toml
 └── README.md
 ```
