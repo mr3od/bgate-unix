@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
-    branches: [main]
+    branches: [master]
 
 jobs:
   lint:
@@ -23,6 +23,9 @@ jobs:
 
       - name: Install dependencies
         run: uv sync --extra dev
+
+      - name: Check lockfile sync
+        run: uv lock --check
 
       - name: Run ruff format check
         run: uv run ruff format --check .
@@ -51,10 +54,11 @@ jobs:
         run: uv run ty check src/
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     needs: [lint, typecheck]
     strategy:
       matrix:
+        os: [ubuntu-latest, macos-latest]
         python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
@@ -73,3 +77,6 @@ jobs:
 
       - name: Run tests
         run: uv run pytest --tb=short -v
+
+      - name: CLI smoke test
+        run: uv run bgate --help
