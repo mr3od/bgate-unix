@@ -221,3 +221,4 @@ __marimo__/
 .repomix/bundles.json
 repomix-output.*.xml
 prompts/*.md
+tinker-companion
