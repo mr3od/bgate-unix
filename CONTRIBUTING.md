@@ -87,8 +87,9 @@ bgate-unix/
 │   ├── db.py            # Database layer
 │   └── cli.py           # Typer CLI implementation
 ├── tests/
-│   ├── test_durability.py
-│   └── test_perf_correctness.py
+│   ├── test_deduper.py         # Core functional tests
+│   ├── test_durability.py      # Crash recovery & atomicity tests
+│   └── test_perf_correctness.py # Performance & correctness logic
 ├── pyproject.toml
 └── README.md
 ```

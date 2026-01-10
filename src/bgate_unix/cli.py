@@ -48,7 +48,7 @@ def version_callback(value: bool):
 @app.callback()
 def main(
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Enable debug logging.")] = False,
-    version: Annotated[
+    _version: Annotated[
         bool,
         typer.Option(
             "--version", callback=version_callback, is_eager=True, help="Show version and exit."
