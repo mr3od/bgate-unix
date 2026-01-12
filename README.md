@@ -57,11 +57,22 @@ Incoming File
 
 ## Installation
 
-```bash
-# Using uv (recommended)
-uv add bgate-unix
+### As a CLI Tool (Recommended)
+Install globally in an isolated environment using [uv](https://docs.astral.sh/uv/):
 
-# Using pip
+```bash
+uv tool install bgate-unix
+```
+
+Verify it works:
+```bash
+bgate --help
+```
+
+### As a Library
+```bash
+uv add bgate-unix
+# or
 pip install bgate-unix
 ```
 
@@ -72,8 +83,11 @@ pip install bgate-unix
 `bgate-unix` provides a high-performance CLI for pipeline integration.
 
 ```bash
-# Scan a directory and move unique files to vault
-bgate scan ./incoming --into ./vault --recursive
+# Scan and move unique files to vault (Active Mode)
+bgate scan ./incoming --into ./vault --recursive --move
+
+# Read-only scan (default behavior)
+bgate scan ./incoming --recursive
 
 # Show index statistics
 bgate stats --db dedupe.db
@@ -88,10 +102,10 @@ bgate recover --db dedupe.db
 
 ```bash
 # Install
-pip install bgate-unix
+uv tool install bgate-unix
 
-# Scan and move unique files to tiered storage
-bgate scan ./incoming --into ./vault --recursive
+# Scan and move unique files to tiered storage (Active Mode)
+bgate scan ./incoming --into ./vault --recursive --move
 ```
 
 ### As a Library
